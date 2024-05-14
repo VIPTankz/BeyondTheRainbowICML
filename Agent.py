@@ -5,7 +5,6 @@ import torch as T
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from PERNoAlpha import UniformReplayBuffer, PrioritizedReplayBuffer, prep_observation_for_qnet
 from memory import ReplayMemory
 from ExperienceReplay import RegularReplayMemory
 import numpy as np
