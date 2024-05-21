@@ -14,8 +14,9 @@ For our results, we provide a .csv file named results.csv, containing the result
 In order to run our results, first install our environment via the requirements.txt file (all code was tested on Python 3.11.0):
 
 run: pip install -r requirements.txt
+Download your correct version of pytorch here: https://pytorch.org/
 
-(Also note PyTorch has different versions for different platforms, so you may need to install it from there website: https://pytorch.org/. We Use PyTorch version 2.1.2, with cuda v1.21)
+(We Use PyTorch version 2.1.2, with cuda v1.21)
 
 After installing the environment, you can use main.py to perform runs. The default game is BattleZone, however you can change this using the command line argument --game "GameName". (ie --game Breakout)
 
