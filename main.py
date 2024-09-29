@@ -121,7 +121,6 @@ def main():
     parser.add_argument('--maxpool_size', type=int, default=6)
     parser.add_argument('--lr', type=float, default=1e-4)
     parser.add_argument('--testing', type=bool, default=False)
-    parser.add_argument('--ema_tau', type=float, default=2.5e-4)
     parser.add_argument('--munch', type=int, default=1)
     parser.add_argument('--munch_alpha', type=float, default=0.9)
     parser.add_argument('--grad_clip', type=int, default=10)
@@ -140,7 +139,6 @@ def main():
     parser.add_argument('--dueling', type=int, default=1)
     parser.add_argument('--linear_size', type=int, default=512)
     parser.add_argument('--model_size', type=float, default=2)
-    parser.add_argument('--tr', type=int, default=0)
 
     parser.add_argument('--double', type=int, default=0)
     parser.add_argument('--ncos', type=int, default=64)
@@ -161,7 +159,6 @@ def main():
     envs = args.envs
     bs = args.bs
     rr = args.rr
-    tr = args.tr
     c = args.c
     ema_tau = args.ema_tau
     lr = args.lr
