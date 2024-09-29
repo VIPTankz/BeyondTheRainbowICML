@@ -86,16 +86,16 @@ def create_network(impala, iqn, input_dims, n_actions, spectral_norm, device, no
 
 class Agent:
     def __init__(self, n_actions, input_dims, device, num_envs, agent_name, total_frames, testing=False, batch_size=256
-                 , rr=1, maxpool_size=6, lr=1e-4, ema=False, trust_regions=False, target_replace=500, ema_tau=0.001,
+                 , rr=1, maxpool_size=6, lr=1e-4, target_replace=500,
                  noisy=True, spectral=True, munch=True, iqn=True, double=False, dueling=True, impala=True,
-                 discount=0.997, adamw=False, discount_anneal=False, per=True,
+                 discount=0.997, per=True,
                  taus=8, model_size=2, linear_size=512, ncos=64, rainbow=False, maxpool=True,
                  non_factorised=False, replay_period=1, analytics=False, framestack=4,
-                 rgb=False, imagex=84, imagey=84, pruning=False, arch='impala', per_alpha=0.2,
+                 rgb=False, imagex=84, imagey=84, arch='impala', per_alpha=0.2,
                  per_beta_anneal=False, layer_norm=False, max_mem_size=1048576, c51=False,
-                 eps_steps=2000000, eps_disable=True, stoch=False, perturb=False,
-                 activation="relu", selfnorm=False, pessimistic=False, n=3, munch_alpha=0.9, sam=False,
-                 grad_clip=10, chain=False):
+                 eps_steps=2000000, eps_disable=True,
+                 activation="relu", n=3, munch_alpha=0.9,
+                 grad_clip=10):
 
         if rainbow:
             lr = 6.25e-5
