@@ -11,7 +11,6 @@ from torch.nn import init
 import torch.nn.functional as F
 import numpy as np
 import time
-from encoder import MobileNetV3Encoder, Impala3D, convnextv2_atto, convnextv2_RL
 #from torchvision.utils import save_image
 
 class NoisyLinear(nn.Module):
@@ -608,18 +607,8 @@ class ImpalaCNNLargeIQN(nn.Module):
         self.in_depth = in_depth
 
         self.activation = activation
-        if self.activation == "relu":
-            conv_activation = nn.ReLU
-            activation = nn.ReLU
-        elif self.activation == "gelu":
-            activation = nn.GELU
-            conv_activation = nn.GELU
-        elif self.activation == "prelu":
-            activation = nn.PReLU
-            conv_activation = nn.PReLU
-        elif self.activation == "selu":
-            activation = nn.SELU
-            conv_activation = nn.ReLU
+          conv_activation = nn.ReLU
+
 
         self.linear_size = linear_size
         self.num_tau = num_tau
@@ -644,35 +633,32 @@ class ImpalaCNNLargeIQN(nn.Module):
         else:
             norm_func = identity
 
-        if arch == "impala":
-            self.conv = nn.Sequential(
-                ImpalaCNNBlock(in_depth, int(16*model_size), norm_func=norm_func, activation=conv_activation,
-                               layer_norm=self.layer_norm,
-                               layer_norm_shapes=([int(16*model_size), 84, 84], [int(16*model_size), 42, 42])),
-                ImpalaCNNBlock(int(16*model_size), int(32*model_size), norm_func=norm_func, activation=conv_activation,
-                                layer_norm=self.layer_norm,
-                               layer_norm_shapes=([int(32*model_size), 42, 42], [int(32*model_size), 21, 21])),
-                ImpalaCNNBlock(int(32*model_size), int(32*model_size), norm_func=norm_func, activation=conv_activation,
-                                layer_norm=self.layer_norm,
-                               layer_norm_shapes=([int(32*model_size), 21, 21], [int(32*model_size), 11, 11])),
-                nn.ReLU()
-            )
 
-            if self.maxpool:
-                self.pool = torch.nn.AdaptiveMaxPool2d((self.maxpool_size, self.maxpool_size))
-                if self.maxpool_size == 8:
-                    self.conv_out_size = 2048 * model_size
-                elif self.maxpool_size == 6:
-                    self.conv_out_size = int(1152 * model_size)
-                elif self.maxpool_size == 4:
-                    self.conv_out_size = 512 * model_size
-                else:
-                    raise Exception("No Conv out size for this maxpool size")
-            else:
-                self.conv_out_size = int(32 * model_size * 11 * 11)
-        else:
-            raise Exception("Encoder Architecture Not Found")
+          self.conv = nn.Sequential(
+              ImpalaCNNBlock(in_depth, int(16*model_size), norm_func=norm_func, activation=conv_activation,
+                             layer_norm=self.layer_norm,
+                             layer_norm_shapes=([int(16*model_size), 84, 84], [int(16*model_size), 42, 42])),
+              ImpalaCNNBlock(int(16*model_size), int(32*model_size), norm_func=norm_func, activation=conv_activation,
+                              layer_norm=self.layer_norm,
+                             layer_norm_shapes=([int(32*model_size), 42, 42], [int(32*model_size), 21, 21])),
+              ImpalaCNNBlock(int(32*model_size), int(32*model_size), norm_func=norm_func, activation=conv_activation,
+                              layer_norm=self.layer_norm,
+                             layer_norm_shapes=([int(32*model_size), 21, 21], [int(32*model_size), 11, 11])),
+              nn.ReLU()
+          )
 
+          if self.maxpool:
+              self.pool = torch.nn.AdaptiveMaxPool2d((self.maxpool_size, self.maxpool_size))
+              if self.maxpool_size == 8:
+                  self.conv_out_size = 2048 * model_size
+              elif self.maxpool_size == 6:
+                  self.conv_out_size = int(1152 * model_size)
+              elif self.maxpool_size == 4:
+                  self.conv_out_size = 512 * model_size
+              else:
+                  raise Exception("No Conv out size for this maxpool size")
+          else:
+              self.conv_out_size = int(32 * model_size * 11 * 11)
 
         self.cos_embedding = nn.Linear(self.n_cos, self.conv_out_size)
 
@@ -777,133 +763,6 @@ class ImpalaCNNLargeIQN(nn.Module):
         #print('... loading checkpoint ...')
         self.load_state_dict(torch.load(name))
 
-
-class BTR_RNN(nn.Module):
-    """
-    Implementation of the large variant of the IMPALA CNN introduced in Espeholt et al. (2018).
-    """
-    def __init__(self, in_depth, actions, model_size=2, spectral=True, device='cuda:0',
-                maxpool=True, maxpool_size=6, dueling=True, linear_size=512, seq_len=40, imagex=84, imagey=84):
-        super().__init__()
-
-        self.start = time.time()
-        self.model_size = model_size
-        self.actions = actions
-        self.device = device
-        self.maxpool = maxpool
-        self.dueling = dueling
-        self.in_depth = in_depth
-
-        self.imagex = imagex
-        self.imagey = imagey
-
-        self.linear_size = linear_size
-
-        self.maxpool_size = maxpool_size
-
-        self.hidden_size = linear_size
-
-        self.seq_len = seq_len
-
-        activation = nn.ReLU
-
-        def identity(p): return p
-
-        if spectral:
-            norm_func = torch.nn.utils.parametrizations.spectral_norm
-        else:
-            norm_func = identity
-
-        self.conv = nn.Sequential(
-            ImpalaCNNBlock(in_depth, int(16*model_size), norm_func=norm_func, activation=activation),
-            ImpalaCNNBlock(int(16*model_size), int(32*model_size), norm_func=norm_func, activation=activation),
-            ImpalaCNNBlock(int(32*model_size), int(32*model_size), norm_func=norm_func, activation=activation),
-            nn.ReLU()
-        )
-
-        if self.maxpool:
-            self.pool = torch.nn.AdaptiveMaxPool2d((self.maxpool_size, self.maxpool_size))
-            if self.maxpool_size == 8:
-                self.conv_out_size = 2048*model_size
-            elif self.maxpool_size == 6:
-                self.conv_out_size = int(1152*model_size)
-            elif self.maxpool_size == 4:
-                self.conv_out_size = 512*model_size
-            else:
-                raise Exception("No Conv out size for this maxpool size")
-        else:
-            self.conv_out_size = 32*model_size*11*11
-
-        self.torso = nn.Linear(self.conv_out_size, self.linear_size)
-
-        self.lstm = nn.LSTM(self.linear_size, self.linear_size, num_layers=1, batch_first=True)
-
-        #self.fcA = nn.Linear(self.linear_size, actions)
-        #self.fcV = nn.Linear(self.linear_size, 1)
-
-        self.V = nn.Sequential(nn.Linear(self.linear_size, self.linear_size),
-                          activation(), nn.Linear(self.linear_size, 1))
-
-        self.A = nn.Sequential(nn.Linear(self.linear_size, self.linear_size),
-                          activation(), nn.Linear(self.linear_size, actions))
-
-        self.to(device)
-
-    #@torch.autocast('cuda')
-    def forward(self, inputt, hiddens, advantages_only=False):
-        # hiddens should be shape (1, batch_size, linear_size)
-
-        # input should be batchsize, seq_len, framestack, x, y
-
-        out, hiddens = self.get_lstm_out(inputt, hiddens)
-        #print("LSTM outputs shapes")
-        #print(out.shape)
-        #print(hiddens[0].shape)
-
-        #print("out shape")
-        # should be (seq_len, hidden size)
-        #print(out.shape)
-
-        A = self.A(out)
-        if advantages_only:
-            return A, hiddens
-
-        V = self.V(out)
-
-        return V + (A - torch.mean(A, dim=2, keepdim=True)), hiddens
-
-    def get_lstm_out(self, inputt, hiddens):
-
-        inputt = inputt.float() / 255
-        batch_size = inputt.size()[0]
-        seq_len = inputt.size()[1]
-        #print(f"batch size: {batch_size}")
-        #print(f"Seq Len: {seq_len}")
-
-        conv_in = inputt.reshape(batch_size * seq_len, self.in_depth, self.imagex, self.imagey)
-
-        #print(f"conv input: {conv_in.shape}")
-
-        x = self.conv(conv_in)
-
-        if self.maxpool:
-            x = self.pool(x)
-
-        x = x.reshape(batch_size, seq_len, -1)
-        #print(f"conv output: {x.shape}")
-        x = self.torso(x)
-        #print(f"torso output: {x.shape}")
-        h0, c0 = hiddens
-
-        return self.lstm(x, (h0, c0))
-
-    def save_checkpoint(self, name):
-        #print('... saving checkpoint ...')
-        torch.save(self.state_dict(), name + ".model")
-
-    def load_checkpoint(self, name):
-        #print('... loading checkpoint ...')
-        self.load_state_dict(torch.load(name))
 
 
 
