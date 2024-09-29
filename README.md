@@ -6,17 +6,15 @@ In this paper, show Rainbow DQN extended with the following 6 extensions:
 
 Here are our results on the Atari-5 and 60 game subsets:
 
-
-<img width="644" alt="Indiv60Github" src="https://github.com/user-attachments/assets/40d9fdcd-f648-4f6e-816e-6e5ebd3053c3">
 <img width="1464" alt="IndivAblationsGithub" src="https://github.com/user-attachments/assets/5006518b-24e8-48da-94bb-a3f7b595c361">
-
-
+<img width="644" alt="Indiv60Github" src="https://github.com/user-attachments/assets/40d9fdcd-f648-4f6e-816e-6e5ebd3053c3">
 
 For our results, we provide a .csv file named results.csv, containing the results for each game. For each game, there are 200 evaluations, one for each million frames. Per evaluation, there are 100 episode scores.
 
 In order to run our results, first install our environment via the requirements.txt file (all code was tested on Python 3.11.0):
 
 run: pip install -r requirements.txt
+
 Download your correct version of pytorch here: https://pytorch.org/
 
 (We Use PyTorch version 2.1.2, with cuda v1.21)
