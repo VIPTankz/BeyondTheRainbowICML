@@ -3,21 +3,26 @@ import numpy as np
 import torch
 import torch as T
 import torch.nn as nn
+import torch.nn.utils.prune
 import torch.nn.functional as F
 import torch.optim as optim
-from memory import ReplayMemory
-from ExperienceReplay import RegularReplayMemory
 import numpy as np
-from collections import deque
-import pickle
-import matplotlib.pyplot as plt
-#from torchsummary import summary
-import math
-from networks import ImpalaCNNLarge, ImpalaCNNLargeIQN, NatureIQN
+from PER import PER
+# from torchsummary import summary
+from networks import ImpalaCNNLarge, ImpalaCNNLargeIQN, NatureIQN, ImpalaCNNLargeC51, FactorizedNoisyLinear
 import networks
-import traceback
+from copy import deepcopy
+from functools import partial
+from Analytic import Analytics
+import matplotlib.pyplot as plt
+from utils import cal_dormant_ratio, TruncatedNormal, perturb
+import math
+from collections import defaultdict
+from sam import SAM
+import torchvision.transforms.functional as TF
 
-class EpsilonGreedy():
+
+class EpsilonGreedy:
     def __init__(self, eps_start, eps_steps, eps_final, action_space):
         self.eps = eps_start
         self.steps = eps_steps
@@ -34,12 +39,77 @@ class EpsilonGreedy():
             return np.random.choice(self.action_space)
 
 
+def randomise_action_batch(x, probs, n_actions):
+    mask = torch.rand(x.shape) < probs
+
+    # Generate random values to replace the selected elements
+    random_values = torch.randint(0, n_actions, x.shape)
+
+    # Apply the mask to replace elements in the tensor with random values
+    x[mask] = random_values[mask]
+
+    return x
+
+
+def choose_eval_action(observation, eval_net, n_actions, device, rng):
+    with torch.no_grad():
+        state = T.tensor(observation, dtype=T.float).to(device)
+        qvals = eval_net.qvals(state, advantages_only=True)
+        x = T.argmax(qvals, dim=1).cpu()
+
+        if rng > 0.:
+            # Generate a mask with the given probability
+            x = randomise_action_batch(x, 0.01, n_actions)
+
+    return x
+
+
+def create_network(impala, iqn, input_dims, n_actions, spectral_norm, device, noisy, maxpool, model_size, maxpool_size,
+                   linear_size, num_tau, dueling, ncos, non_factorised, arch,
+                   layer_norm=False, activation="relu", c51=False):
+    if impala:
+        if iqn:
+            return ImpalaCNNLargeIQN(input_dims[0], n_actions, spectral=spectral_norm, device=device, noisy=noisy,
+                                     maxpool=maxpool, model_size=model_size, num_tau=num_tau, maxpool_size=maxpool_size,
+                                     dueling=dueling, linear_size=linear_size, ncos=ncos,
+                                     arch=arch, layer_norm=layer_norm, activation=activation)
+        if c51:
+            return ImpalaCNNLargeC51(input_dims[0], n_actions, spectral=spectral_norm, device=device,
+                                  noisy=noisy, maxpool=maxpool, model_size=model_size, linear_size=linear_size)
+        else:
+            return ImpalaCNNLarge(input_dims[0], n_actions, spectral=spectral_norm, device=device,
+                                  noisy=noisy, maxpool=maxpool, model_size=model_size, maxpool_size=maxpool_size,
+                                  linear_size=linear_size)
+
+    else:
+        return NatureIQN(input_dims[0], n_actions, device=device, noisy=noisy, num_tau=num_tau, linear_size=linear_size,
+                         non_factorised=non_factorised, dueling=dueling)
+
+
+def apply_pruning(net, apply_sparsity):
+    for name, module in net.named_modules():
+        if name.endswith("2") or name == "cos_embedding" or name.startswith("conv.0"):
+            continue
+
+        if isinstance(module, nn.Conv2d) or isinstance(module, nn.Linear):
+            torch.nn.utils.prune.l1_unstructured(module, name='weight', amount=apply_sparsity)
+        elif isinstance(module, FactorizedNoisyLinear):
+            torch.nn.utils.prune.l1_unstructured(module, name='weight_mu', amount=apply_sparsity)
+            torch.nn.utils.prune.l1_unstructured(module, name='weight_sigma', amount=apply_sparsity)
+
+
 class Agent:
     def __init__(self, n_actions, input_dims, device, num_envs, agent_name, total_frames, testing=False, batch_size=256
                  , rr=1, maxpool_size=6, lr=1e-4, ema=False, trust_regions=False, target_replace=500, ema_tau=0.001,
-                 noisy=True, spectral=True, munch=True, iqn=True, double=False, dueling=True, impala=True, discount=0.997,
-                 adamw=False, ede=False, sqrt=False, discount_anneal=False, lr_decay=False, per=True, taus=8,
-                 model_size=2, linear_size=512, spectral_lin=False, ncos=64, rainbow=False, maxpool=True):
+                 noisy=True, spectral=True, munch=True, iqn=True, double=False, dueling=True, impala=True,
+                 discount=0.997, adamw=False, discount_anneal=False, per=True,
+                 taus=8, model_size=2, linear_size=512, ncos=64, rainbow=False, maxpool=True,
+                 non_factorised=False, replay_period=1, analytics=False, framestack=4,
+                 rgb=False, imagex=84, imagey=84, pruning=False, arch='impala', per_alpha=0.2,
+                 per_beta_anneal=False, layer_norm=False, max_mem_size=1048576, c51=False,
+                 eps_steps=2000000, eps_disable=True, stoch=False, perturb=False,
+                 activation="relu", selfnorm=False, pessimistic=False, n=3, munch_alpha=0.9, sam=False,
+                 grad_clip=10, chain=False):
 
         if rainbow:
             lr = 6.25e-5
@@ -55,53 +125,86 @@ class Agent:
             per = True
             noisy = True
             linear_size = 512
-            self.per_alpha = 0.4
+            self.per_alpha = 0.5
         else:
-            self.per_alpha = 0.2
-            c51 = False
+            self.per_alpha = per_alpha
 
         self.procgen = True if input_dims[1] == 64 else False
+        self.grad_clip = grad_clip
+
+        self.chain = chain
+        if self.chain:
+            self.chain_bs = 64
+            self.chain_qvals = None
+            self.chain_argmaxs = None
+            self.chain_refs = None
+
+            self.running_Q_loss = 0
+            self.running_penalty = 1
+            self.chain_adapt_beta = 0.05
 
         self.n_actions = n_actions
         self.input_dims = input_dims
         self.device = device
         self.agent_name = agent_name
         self.testing = testing
+        self.activation = activation
+
+        self.pessimistic = pessimistic
+        if self.pessimistic:
+            self.pess_scale = 25
+
+        self.selfnorm = selfnorm
+        if self.selfnorm:
+            self.activation = "selu"
+        self.layer_norm = layer_norm
+
+        self.perturb = perturb
+
 
         self.loading_checkpoint = False
 
-        if not self.loading_checkpoint:
-            self.per_beta = 0.4
-        else:
-            self.per_beta = 0.7
+        self.per_beta = 0.45
+        self.per_beta_anneal = per_beta_anneal
+        if self.per_beta_anneal:
+            self.per_beta = 0
 
         self.replay_ratio = int(rr) if rr > 0.99 else float(rr)
         self.total_frames = total_frames
         self.num_envs = num_envs
 
         if self.testing:
-            self.min_sampling_size = 8000
+            self.min_sampling_size = 4000
         else:
             self.min_sampling_size = 200000
 
         self.lr = lr
 
-        self.total_grad_steps = (self.total_frames - self.min_sampling_size) / (self.num_envs / self.replay_ratio)
+        self.analytics = analytics
+        if self.analytics:
+            self.analytic_object = Analytics(agent_name, testing)
+
+        # this is the number of env steps per grad step
+        self.replay_period = replay_period
+
+        # replay ratio however does not take into account parallel envs
+
+        # in this code, every {replay period} steps, we take {replay_ratio} grad steps
+
+        self.total_grad_steps = (self.total_frames - self.min_sampling_size) / (self.replay_period / self.replay_ratio)
 
         self.priority_weight_increase = (1 - self.per_beta) / self.total_grad_steps
 
         self.action_space = [i for i in range(self.n_actions)]
         self.learn_step_counter = 0
 
-        self.lr_decay = lr_decay
-        if self.lr_decay:
-            self.lambda_lr = lambda frame: max(1.0 - frame / self.total_grad_steps, 0)
+        if self.perturb:
+            # perturb once every million frames
+            self.perturb_every = int(self.total_grad_steps / ((total_frames*4) / 1000000))
 
         self.chkpt_dir = ""
 
-        # IMPORTANT params, check these
-
-        self.n = 3
+        self.n = n
         if discount_anneal:
             self.discount_anneal = True
             self.gamma = 0.97
@@ -119,8 +222,11 @@ class Agent:
         self.spectral_norm = spectral  # rememberance of the bug that passed gpu tensor into env
         # and caused nans which somehow showed up in the PER sample function.
 
-        self.spectral_lin = spectral_lin
         self.noisy = noisy
+
+        # this option is only available for non-impala. I could add it, but factorised seemed
+        # to perform the same and is faster
+        self.non_factorised = non_factorised
 
         self.per_splits = 1
         if self.per_splits > num_envs:
@@ -135,27 +241,33 @@ class Agent:
 
         self.ncos = ncos
 
-        self.ede = ede  # NOT FINISHED
         self.adamw = adamw
-        self.sqrt = sqrt
 
         self.double = double  # Not implemented for IQN and Munchausen
         self.maxpool = maxpool
         self.munchausen = munch
 
+        self.stoch = stoch
+
         if self.munchausen:
             self.entropy_tau = 0.03
             self.lo = -1
-            self.alpha = 0.9
+            self.alpha = munch_alpha
 
         # 1 Million rounded to the nearest power of 2 for tree implementation
-        self.max_mem_size = 1048576
+        self.max_mem_size = max_mem_size
+
+        self.soft_update_tau = ema_tau  # 0.001 for non-sample-eff
+        self.replace_target_cnt = target_replace  # This is the number of grad steps - could be a little jank
+        # when changing num_envs/batch size/replay ratio
+
 
         # target_net, ema, trust_region
         if ema:
             self.stabiliser = "ema"
         elif trust_regions:
             self.stabiliser = "trust_regions"
+            self.tr_period = 1500
         else:
             self.stabiliser = "target"
 
@@ -171,23 +283,22 @@ class Agent:
         else:
             self.trust_regions = False
 
-        self.soft_update_tau = ema_tau  # 0.001 for non-sample-eff
-        self.replace_target_cnt = target_replace  # This is the number of grad steps - could be a little jank
-        # when changing num_envs/batch size/replay ratio
+
+        # Best used value is 32000 frames per replace. For bs 256, this is 500. For bs 16, this is every 8000!
 
         self.tr_alpha = 1
-        self.tr_period = 1500
 
-        self.loss_type = "huber"  # NOT IMPLEMENTED
+        self.loss_type = "huber"  # This is only for non-iqn, non-munchausen, c51
+        if self.loss_type == "huber":
+            loss_fn_cls = nn.SmoothL1Loss
+            self.loss_fn = loss_fn_cls(reduction=('none'))
 
-        if self.iqn:
-            self.num_tau = taus
+        self.num_tau = taus
 
         if self.loading_checkpoint:
-            self.per_beta = 0.8
             self.min_sampling_size = 300000
 
-        #c51
+        # c51
         self.Vmax = 10
         self.Vmin = -10
         self.N_ATOMS = 51
@@ -195,85 +306,63 @@ class Agent:
         if not self.loading_checkpoint and not self.testing:
             self.eps_start = 1.0
             # divided by 4 is due to frameskip
-            self.eps_steps = 2000000
+            self.eps_steps = eps_steps
             self.eps_final = 0.01
         else:
-            self.eps_start = 0.01
-            self.eps_steps = 250000
-            self.eps_final = 0.01
+            self.eps_start = 0.00
+            self.eps_steps = eps_steps
+            self.eps_final = 0.00
 
+        self.eps_disable = eps_disable
         self.epsilon = EpsilonGreedy(self.eps_start, self.eps_steps, self.eps_final, self.action_space)
 
         self.per = per
 
-        self.outputs = {}
-        self.dormant_tau = 0.025
-
         self.linear_size = linear_size
+        self.arch = arch
 
-        # code for no alpha PER - appears to perform slightly worse
-        # self.use_amp = False
+        # self.memories = []
         # if self.per:
-        #     self.buffer = PrioritizedReplayBuffer(self.min_sampling_size, self.max_mem_size, self.gamma, self.n,
-        #                                           self.num_envs, use_amp=self.use_amp)
+        #     for i in range(num_envs):
+        #         self.memories.append(ReplayMemory(self.max_mem_size // num_envs, self.n, self.gamma, device, alpha=self.per_alpha, beta=self.per_beta, procgen=self.procgen))
         # else:
-        #     self.buffer = UniformReplayBuffer(self.min_sampling_size, self.max_mem_size, self.gamma, self.n,
-        #                                       self.num_envs, use_amp=self.use_amp)
+        #     for i in range(num_envs):
+        #         self.memories.append(RegularReplayMemory(self.max_mem_size // num_envs, self.n, self.gamma, device))
 
-        self.memories = []
-        if self.per:
-            for i in range(num_envs):
-                self.memories.append(ReplayMemory(self.max_mem_size // num_envs, self.n, self.gamma, device, alpha=self.per_alpha, beta=self.per_beta, procgen=self.procgen))
-        else:
-            for i in range(num_envs):
-                self.memories.append(RegularReplayMemory(self.max_mem_size // num_envs, self.n, self.gamma, device))
+        self.framestack = framestack
+        self.rgb = rgb
+        self.memory = PER(self.max_mem_size, device, self.n, num_envs, self.gamma, alpha=self.per_alpha,
+                          beta=self.per_beta, framestack=self.framestack, rgb=self.rgb, imagex=imagex, imagey=imagey)
 
-        if self.impala:
-            if not self.iqn:
-                self.net = ImpalaCNNLarge(self.input_dims[0], self.n_actions,spectral=self.spectral_norm, device=self.device,
-                                             noisy=self.noisy, maxpool=self.maxpool, model_size=self.model_size, maxpool_size=self.maxpool_size,
-                                          linear_size=self.linear_size)
+        self.network_creator_fn = partial(create_network, self.impala, self.iqn, self.input_dims, self.n_actions,
+                                          self.spectral_norm, self.device,
+                                          self.noisy, self.maxpool, self.model_size, self.maxpool_size,
+                                          self.linear_size,
+                                          self.num_tau, self.dueling, self.ncos,
+                                          self.non_factorised, self.arch, layer_norm=self.layer_norm,
+                                          activation=self.activation, c51=self.c51)
 
-                self.tgt_net = ImpalaCNNLarge(self.input_dims[0], self.n_actions,spectral=self.spectral_norm, device=self.device,
-                                             noisy=self.noisy, maxpool=self.maxpool, model_size=self.model_size, maxpool_size=self.maxpool_size,
-                                              linear_size=self.linear_size)
-            else:
-                # This is the BTR Network
-                self.net = ImpalaCNNLargeIQN(self.input_dims[0], self.n_actions,spectral=self.spectral_norm,
-                                                 device=self.device, noisy=self.noisy, maxpool=self.maxpool,
-                                                 model_size=self.model_size, num_tau=self.num_tau,
-                                                 maxpool_size=self.maxpool_size, dueling=dueling,
-                                                 linear_size=self.linear_size, spectral_lin=spectral_lin, ncos=self.ncos,)
+        self.net = self.network_creator_fn()
+        self.tgt_net = self.network_creator_fn()
 
-                self.tgt_net = ImpalaCNNLargeIQN(self.input_dims[0], self.n_actions,spectral=self.spectral_norm,
-                                                 device=self.device, noisy=self.noisy, maxpool=self.maxpool,
-                                                 model_size=self.model_size, num_tau=self.num_tau,
-                                                 maxpool_size=self.maxpool_size, dueling=dueling,
-                                                 linear_size=self.linear_size, spectral_lin=spectral_lin, ncos=self.ncos)
-
-
-        else:
-            self.net = NatureIQN(self.input_dims[0], self.n_actions, device=self.device,
-                                     noisy=self.noisy, num_tau=self.num_tau, linear_size=self.linear_size)
-
-            self.tgt_net = NatureIQN(self.input_dims[0], self.n_actions, device=self.device,
-                                     noisy=self.noisy, num_tau=self.num_tau, linear_size=self.linear_size)
-
+        self.sam = sam
         if self.adamw:
             self.optimizer = optim.AdamW(self.net.parameters(), lr=self.lr, eps=0.005 / self.batch_size,
                                          weight_decay=1e-4)  # weight decay taken from museli
+        elif self.selfnorm:
+            self.optimizer = optim.Adam(self.net.parameters(), lr=self.lr, betas=(0.9, 0.99), eps=0.01)
+        elif self.sam:
+            base_optimizer = optim.Adam
+            self.optimizer = SAM(self.net.parameters(), base_optimizer, lr=self.lr, eps=0.005 / self.batch_size)
         else:
             self.optimizer = optim.Adam(self.net.parameters(), lr=self.lr, eps=0.005 / self.batch_size)  # 0.00015
 
         self.net.train()
-        #if self.noisy:
-        #self.tgt_net.train()
+
+        self.eval_net = None
 
         for param in self.tgt_net.parameters():
             param.requires_grad = False
-
-        if self.lr_decay:
-            self.scheduler = optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda=self.lambda_lr)
 
         self.env_steps = 0
         self.grad_steps = 0
@@ -282,43 +371,61 @@ class Agent:
         self.eval_mode = False
 
         if self.loading_checkpoint:
-            self.load_models()
+            self.load_models("insert_model_name")
 
-    def calculate_parameter_norms(self, norm_type=2):
-        self.test_net.load_state_dict(self.net.state_dict())
-        # Dictionary to store the norms
-        norms = {}
-        # Iterate through all named parameters
-        for name, param in self.test_net.named_parameters():
-            if 'weight' in name:
-                # Calculate the norm of the parameter
-                norm = torch.norm(param, p=norm_type).item()  # .item() converts a one-element tensor to a scalar
-                # Store the norm in the dictionary
-                norms[name] = norm
+        self.tot_churns = 0
+        self.cum_churns = 0
+        self.all_grad_mag = 0
+        self.last_acts = [0 for i in range(self.num_envs)]
+        self.tot_avgs = 0
+        self.tot_swaps = 0
+        self.cum_act_gap = 0
 
-        norms_tot = 0
-        count = 0
-        for key, value in norms.items():
-            count += 1
-            norms_tot += value
+        self.prune = pruning
+        #if self.prune and self.spectral_norm:
+        #raise Exception("Cannot use both pruning and spectral norm")
+        if self.prune:
+            self.desired_sparsity = 0.95
+            self.last_sparsity = 0.
+            self.start_prune = 0.2
+            self.end_prune = 0.8
 
-        norms_tot /= count
+            # this ensures the hooks are set up
+            apply_pruning(self.tgt_net, 0.0)
+            apply_pruning(self.net, 0.0)
 
-        return norms_tot
+    def prune_network(self):
+        # applies pruning
+        # doesn't apply to first and last layers
+        # doesn't work with spec norm, and untested with NoisyLayers
+        current_progress = self.grad_steps / self.total_grad_steps
+
+        if current_progress < self.start_prune or current_progress > self.end_prune:
+            return
+
+        cur_sparsity = self.desired_sparsity * \
+                       (1 - (1 - (current_progress - self.start_prune) / (self.end_prune - self.start_prune)) ** 3)
+
+        apply_sparsity = (cur_sparsity - self.last_sparsity) / (1 - self.last_sparsity)
+
+        # print("Applied Sparsity")
+        # print(apply_sparsity)
+        #
+        # print("Target Sparsity")
+        # print(cur_sparsity)
+
+        apply_pruning(self.net, apply_sparsity)
+
+        self.last_sparsity = cur_sparsity
+
+
 
     def get_grad_steps(self):
         return self.grad_steps
 
-    def set_eval_mode(self):
-        self.disable_noise(self.net)
-        self.net.eval()
-        self.tgt_net.eval()
-        self.eval_mode = True
-
-    def set_train_mode(self):
-        self.net.train()
-        self.tgt_net.train()
-        self.eval_mode = False
+    def prep_evaluation(self):
+        self.eval_net = deepcopy(self.net)
+        self.disable_noise(self.eval_net)
 
     @torch.no_grad()
     def reset_noise(self, net):
@@ -333,37 +440,65 @@ class Agent:
                 m.disable_noise()
 
     def choose_action(self, observation):
+        # this chooses an action for a batch. Can be used with a batch of 1 if needed though
         with T.no_grad():
             if self.noisy and not self.eval_mode:
                 self.reset_noise(self.net)
 
-            #state = prep_observation_for_qnet(torch.from_numpy(np.stack(observation)), self.use_amp)
+            state = T.tensor(observation, dtype=int).to(self.net.device)
+
+            ####################
+            # for i in range(len(state)):
+            #     # Apply transformations to each frame in the sequence
+            #     for j in range(4):  # Assuming 4 is the second dimension representing frames
+            #         state[i, j] = TF.adjust_brightness(state[i, j], 0.1)
+            #         state[i, j] = TF.adjust_saturation(state[i, j], 0.1)
+            #         state[i, j] = TF.adjust_hue(state[i, j], 0.1)
+            #         #state[i, j] = TF.adjust_contrast(state[i, j], 0.1)
+            ####################################
+
             state = T.tensor(observation, dtype=T.float).to(self.net.device)
-            qvals = self.net.qvals(state, advantages_only=True)
 
-            x = T.argmax(qvals, dim=1).cpu()
-            # this should contain (num_envs) different actions
+            if self.stoch:
+                qvals = self.net.qvals(state, advantages_only=False)
+                probs = F.softmax(qvals / self.entropy_tau, dim=1)
+                x = torch.multinomial(probs, num_samples=1).cpu()
+            else:
+                qvals = self.net.qvals(state, advantages_only=True)
+                x = T.argmax(qvals, dim=1).cpu()
 
-            if self.eval_mode:
-                for i in range(len(observation)):
-                    if np.random.random() > 0.99:
-                        x[i] = np.random.choice(self.action_space)
+                ############### code for action swaps and action gaps
+                # for i in range(self.num_envs):
+                #     top2_vals = torch.topk(qvals[i], 2).values
+                #     self.cum_act_gap += torch.abs(top2_vals[0] - top2_vals[1])
+                #
+                #     if x[i] != self.last_acts[i]:
+                #         self.last_acts[i] = x[i]
+                #         self.tot_swaps += 1
+                #     self.tot_avgs += 1
+                # if np.random.random() > 0.99:
+                #     print(f"Action Swap Percent {self.tot_swaps / self.tot_avgs}")
+                #     print(f"Action Gap {self.cum_act_gap / self.tot_avgs}")
+                #     print()
+                ####################
 
-            elif self.env_steps < self.min_sampling_size or not self.noisy or self.env_steps < self.total_frames / 2:
-                for i in range(len(observation)):
-                    action = self.epsilon.choose_action()
-                    if action is not None:
-                        x[i] = action
+            if self.env_steps < self.min_sampling_size or not self.noisy or \
+                    (self.env_steps < self.total_frames / 2 and self.eps_disable):
+
+                probs = self.epsilon.eps
+                x = randomise_action_batch(x, probs, self.n_actions)
 
             return x
 
-    def store_transition(self, state, action, reward, done, stream, prio=None):
-        if prio is None:
-            self.memories[stream].append(torch.from_numpy(state), action, reward, done)
-        else:
-            self.memories[stream].append(torch.from_numpy(state), action, reward, done, 0)
+    def store_transition(self, state, action, reward, next_state, done, stream, prio=True):
 
-        #self.buffer.put(state, action, reward, done, j=stream)
+        if self.rgb:
+            # expand dims to create "framestack" dim, so it works with my replay buffer
+            state = np.expand_dims(state, axis=0)
+            next_state = np.expand_dims(next_state, axis=0)
+
+        self.memory.append(state, action, reward, next_state, done, stream, prio=prio)
+
         self.epsilon.update_eps()
         self.env_steps += 1
 
@@ -377,7 +512,6 @@ class Agent:
         self.net.load_checkpoint(name)
         self.tgt_net.load_checkpoint(name)
 
-
     def soft_update(self):
         """Soft update model parameters.
         θ_target = τ*θ_local + (1 - τ)*θ_target
@@ -389,8 +523,17 @@ class Agent:
         """
         with torch.no_grad():
             for target_param, local_param in zip(self.tgt_net.parameters(), self.net.parameters()):
-                target_param.data.copy_(self.soft_update_tau*local_param.data + (1.0-self.soft_update_tau)*target_param.data)
+                target_param.data.copy_(
+                    self.soft_update_tau * local_param.data + (1.0 - self.soft_update_tau) * target_param.data)
 
+    def activation_hook(self, module, input, output):
+        if self.use_hooks:
+            if isinstance(output, tuple):
+                # If the output is a tuple, detach each element
+                self.activations[module].append(tuple(o.detach() for o in output))
+            else:
+                # If it's a single tensor, detach it directly
+                self.activations[module].append(output.detach())
     def learn(self):
         if self.replay_ratio < 1:
             if self.replay_ratio_cnt == 0:
@@ -400,88 +543,17 @@ class Agent:
             for i in range(self.replay_ratio):
                 self.learn_call()
 
-    def sample(self):
-        if self.per:
-            # get total priority from each tree
-            buffer_totals = np.empty(self.num_envs, dtype=float)
-            for i in range(self.num_envs):
-                buffer_totals[i] = self.memories[i].transitions.total()
-
-            # create probability distribution based on prios
-            buffer_dist = buffer_totals / buffer_totals.sum()
-
-            if self.per_splits > 1:
-                mem = 0
-                mems = np.random.choice(self.num_envs, self.per_splits, replace=False, p=buffer_dist)
-
-                idxs, states, actions, rewards, next_states, dones, weights = self.memories[mems[0]].sample(
-                    self.batch_size // self.per_splits)
-
-                for i in range(self.per_splits - 1):
-
-                    idxsN, statesN, actionsN, rewardsN, next_statesN, donesN, weightsN = self.memories[mems[i + 1]].sample(
-                        self.batch_size // self.per_splits)
-
-                    idxs = np.concatenate((idxs, idxsN))
-                    states = torch.cat((states, statesN))
-                    actions = torch.cat((actions, actionsN))
-                    rewards = torch.cat((rewards, rewardsN))
-                    next_states = torch.cat((next_states, next_statesN))
-                    dones = torch.cat((dones, donesN))
-                    weights = torch.cat((weights, weightsN))
-
-            else:
-                mems = 0
-                # this is a slight simplification of PER, but runs MUCH faster with very little memory
-                mem = np.random.choice(self.num_envs, self.per_splits, replace=False, p=buffer_dist)[0]
-                idxs, states, actions, rewards, next_states, dones, weights = self.memories[mem].sample(
-                    self.batch_size)
-
-            dones = dones.squeeze()
-
-        else:
-            weights = 0
-            idxs = 0
-            mem = 0
-            mems = 0
-            # this gets how many we should sample from each experience replay
-            to_sample_from_each = generate_random_sum_array(len(self.memories), self.batch_size)
-
-            states = []
-            actions = []
-            rewards = []
-            next_states = []
-            dones = []
-
-            for i in range(len(self.memories)):
-                if to_sample_from_each[i] > 0:
-                    statesN, actionsN, rewardsN, next_statesN, donesN = self.memories[i].sample(to_sample_from_each[i])
-                    states.append(statesN)
-                    actions.append(actionsN)
-                    rewards.append(rewardsN)
-                    next_states.append(next_statesN)
-                    dones.append(donesN)
-
-            states = torch.cat(states, dim=0)
-            actions = torch.cat(actions, dim=0)
-            rewards = torch.cat(rewards, dim=0)
-            next_states = torch.cat(next_states, dim=0)
-            dones = torch.cat(dones, dim=0)
-
-            dones = dones.squeeze()
-
-        return states, rewards, actions, next_states, dones, weights, idxs, mems, mem
-
     def learn_call(self):
 
         if self.env_steps < self.min_sampling_size:
             return
 
-        if self.per:
-            for i in range(self.num_envs):
-                self.memories[i].priority_weight = min(self.memories[i].priority_weight + self.priority_weight_increase, 1)
+        # if self.per:
+        #     for i in range(self.num_envs):
+        #         self.memories[i].priority_weight = min(self.memories[i].priority_weight + self.priority_weight_increase, 1)
 
-        #self.per_beta = min(1, self.per_beta + self.priority_weight_increase)
+        if self.per and self.per_beta_anneal:
+            self.memory.beta = min(self.memory.beta + self.priority_weight_increase, 1)
 
         if self.discount_anneal:
             self.gamma = min(self.gamma + self.gamma_inc, self.final_gamma)
@@ -492,6 +564,7 @@ class Agent:
             self.reset_noise(self.tgt_net)
 
         if not self.soft_updates:
+
             if self.trust_regions:
                 if self.grad_steps % self.tr_period == 0:
                     self.replace_target_network()
@@ -501,27 +574,43 @@ class Agent:
         else:
             self.soft_update()
 
-        states, rewards, actions, next_states, dones, weights, idxs, mems, mem = self.sample()
+        if self.prune:
+            self.prune_network()
 
-        # if self.per:
-        #     indices, weights, (states, next_states, actions, rewards, dones) = self.buffer.sample(self.batch_size, self.per_beta)
-        #     weights = torch.from_numpy(weights).cuda()
-        # else:
-        #     states, next_states, actions, rewards, dones = self.buffer.sample(self.batch_size)
+        if self.perturb and self.grad_steps % self.perturb_every == 0:
+            # this also resets the optimizer
+            perturb(self.net, self.optimizer, 0.2)
+            perturb(self.tgt_net, self.optimizer, 0.2)
+
+        # states, rewards, actions, next_states, dones, weights, idxs, mems, mem = self.sample()
+        # states, actions, rewards, next_states, dones, weights, idxs = self.memory.sample(self.batch_size)
+
+        idxs, states, actions, rewards, next_states, dones, weights = self.memory.sample(self.batch_size)
+
+        if self.pessimistic:
+            rewards[dones] -= 1 * self.pess_scale
+            # Subtract 1/33.333 where bool_tensor is False
+            rewards[~dones] -= 1 / (333.333 / self.pess_scale)
 
         self.optimizer.zero_grad()
 
         # use this code to check your states are correct
-        """
-        plt.imshow(states[0][0].unsqueeze(dim=0).cpu().permute(1, 2, 0))
-        plt.show()
 
-        plt.imshow(states[1][0].unsqueeze(dim=0).cpu().permute(1, 2, 0))
-        plt.show()
+        # plt.imshow(states[0][0].unsqueeze(dim=0).cpu().permute(1, 2, 0))
+        # plt.show()
+        #
+        # plt.imshow(states[0][1].unsqueeze(dim=0).cpu().permute(1, 2, 0))
+        # plt.show()
+        #
+        # plt.imshow(states[0][2].unsqueeze(dim=0).cpu().permute(1, 2, 0))
+        # plt.show()
+        #
+        # plt.imshow(states[1][0].unsqueeze(dim=0).cpu().permute(1, 2, 0))
+        # plt.show()
+        #
+        # plt.imshow(states[2][0].unsqueeze(dim=0).cpu().permute(1, 2, 0))
+        # plt.show()
 
-        plt.imshow(states[2][0].unsqueeze(dim=0).cpu().permute(1, 2, 0))
-        plt.show()
-        """
 
         if self.c51:
             distr_v, qvals_v = self.net.both(states)
@@ -538,8 +627,8 @@ class Agent:
                 next_best_distr_v = self.tgt_net.apply_softmax(next_best_distr_v)
                 next_best_distr = next_best_distr_v.data.cpu()
 
-                proj_distr = distr_projection(next_best_distr, rewards.cpu(), dones.cpu(), self.Vmin, self.Vmax, self.N_ATOMS,
-                                              self.gamma ** self.n)
+                proj_distr = distr_projection(next_best_distr, rewards.cpu(), dones.cpu(), self.Vmin, self.Vmax,
+                                              self.N_ATOMS, self.gamma ** self.n)
 
                 proj_distr_v = proj_distr.to(self.net.device)
 
@@ -573,12 +662,19 @@ class Agent:
             td_error = q_target - q_pred
             loss_v = torch.abs(td_error)
 
-            if self.per:
-                loss_squared = (td_error.pow(2) * weights.to(self.net.device))
-            else:
-                loss_squared = td_error.pow(2)
+            if self.loss_type == "mse":
+                if self.per:
+                    loss_squared = (td_error.pow(2) * weights.to(self.net.device))
+                else:
+                    loss_squared = td_error.pow(2)
 
-            loss = loss_squared.mean().to(self.net.device)
+                loss = loss_squared.mean().to(self.net.device)
+
+            elif self.loss_type == "huber":
+                losses = self.loss_fn(q_target, q_pred)
+                loss = torch.mean(weights.to(self.net.device) * losses)
+            else:
+                raise Exception("Unknown loss type")
 
         elif not self.iqn and not self.c51 and self.munchausen:  # non-distributional but with munchausen
 
@@ -592,15 +688,16 @@ class Agent:
 
                 Q_targets_next = self.tgt_net.forward(next_states)
 
-                logsum = torch.logsumexp((Q_targets_next - Q_targets_next.max(1)[0].unsqueeze(-1)) / self.entropy_tau, 1).unsqueeze(-1)
+                logsum = torch.logsumexp((Q_targets_next - Q_targets_next.max(1)[0].unsqueeze(-1)) / self.entropy_tau,
+                                         1).unsqueeze(-1)
 
                 tau_log_pi_next = Q_targets_next - Q_targets_next.max(1)[0].unsqueeze(-1) - self.entropy_tau * logsum
 
                 # target policy
                 pi_target = F.softmax(Q_targets_next / self.entropy_tau, dim=1)
-                #Q_target = (self.gamma * (pi_target * (Q_targets_next - tau_log_pi_next) * (~dones.unsqueeze(-1))).sum(1)).unsqueeze(-1)
+                # Q_target = (self.gamma * (pi_target * (Q_targets_next - tau_log_pi_next) * (~dones.unsqueeze(-1))).sum(1)).unsqueeze(-1)
                 Q_target = (self.gamma ** self.n * (
-                            pi_target * (Q_targets_next - tau_log_pi_next) * (~dones)).sum(1)).unsqueeze(1)
+                        pi_target * (Q_targets_next - tau_log_pi_next) * (~dones)).sum(1)).unsqueeze(1)
 
                 # calculate munchausen addon with logsum trick
                 q_k_targets = self.tgt_net(states)
@@ -636,7 +733,7 @@ class Agent:
                 else:
                     Q_targets_next, _ = self.tgt_net(next_states)
 
-                if self.double: #this may be wrong - seems to perform better without. Could just be chance though
+                if self.double:  # this may be wrong - seems to perform better without. Could just be chance though
                     indices = np.arange(self.batch_size)
                     q_actions = self.net.qvals(next_states)
                     max_actions = T.argmax(q_actions, dim=1)
@@ -652,8 +749,7 @@ class Agent:
 
                 # Compute Q targets for current states
                 Q_targets = rewards.unsqueeze(-1) + (
-                            self.gamma ** self.n * Q_targets_next * (~dones.unsqueeze(-1)))
-
+                        self.gamma ** self.n * Q_targets_next * (~dones.unsqueeze(-1)))
 
             # Get expected Q values from local model
             Q_expected, taus = self.net(states)
@@ -685,7 +781,11 @@ class Agent:
 
         elif self.iqn and self.munchausen:
             with torch.no_grad():
-                Q_targets_next, _ = self.tgt_net(next_states)
+
+                if self.trust_regions:
+                    Q_targets_next, _ = self.net(next_states)
+                else:
+                    Q_targets_next, _ = self.tgt_net(next_states)
 
                 # (batch, num_tau, actions)
                 q_t_n = Q_targets_next.mean(dim=1)
@@ -699,40 +799,41 @@ class Agent:
                 # calculate log-pi
                 logsum = torch.logsumexp(
                     (q_t_n - q_t_n.max(1)[0].unsqueeze(-1)) / self.entropy_tau, 1).unsqueeze(-1)  # logsum trick
-                #assert logsum.shape == (self.batch_size, 1), "log pi next has wrong shape: {}".format(logsum.shape)
+                # assert logsum.shape == (self.batch_size, 1), "log pi next has wrong shape: {}".format(logsum.shape)
                 tau_log_pi_next = (q_t_n - q_t_n.max(1)[0].unsqueeze(-1) - self.entropy_tau * logsum).unsqueeze(1)
 
                 pi_target = F.softmax(q_t_n / self.entropy_tau, dim=1).unsqueeze(1)
 
                 Q_target = (self.gamma ** self.n * (
-                            pi_target * (Q_targets_next - tau_log_pi_next) * (~dones.unsqueeze(-1))).sum(2)).unsqueeze(1)
+                        pi_target * (Q_targets_next - tau_log_pi_next) * (~dones.unsqueeze(-1))).sum(2)).unsqueeze(1)
 
-                #assert Q_target.shape == (self.batch_size, 1, self.num_tau)
+                # assert Q_target.shape == (self.batch_size, 1, self.num_tau)
 
                 q_k_target = self.net.qvals(states)
                 v_k_target = q_k_target.max(1)[0].unsqueeze(-1)
                 tau_log_pik = q_k_target - v_k_target - self.entropy_tau * torch.logsumexp(
                     (q_k_target - v_k_target) / self.entropy_tau, 1).unsqueeze(-1)
 
-                #assert tau_log_pik.shape == (self.batch_size, self.n_actions), "shape instead is {}".format(
-                    #tau_log_pik.shape)
+                # assert tau_log_pik.shape == (self.batch_size, self.n_actions), "shape instead is {}".format(
+                # tau_log_pik.shape)
                 munchausen_addon = tau_log_pik.gather(1, actions)
 
                 # calc munchausen reward:
-                munchausen_reward = (rewards + self.alpha * torch.clamp(munchausen_addon, min=self.lo, max=0)).unsqueeze(-1)
-                #assert munchausen_reward.shape == (self.batch_size, 1, 1)
+                munchausen_reward = (
+                        rewards + self.alpha * torch.clamp(munchausen_addon, min=self.lo, max=0)).unsqueeze(-1)
+                # assert munchausen_reward.shape == (self.batch_size, 1, 1)
                 # Compute Q targets for current states
                 Q_targets = munchausen_reward + Q_target
 
             # Get expected Q values from local model
             q_k, taus = self.net(states)
             Q_expected = q_k.gather(2, actions.unsqueeze(-1).expand(self.batch_size, self.num_tau, 1))
-            #assert Q_expected.shape == (self.batch_size, self.num_tau, 1)
+            # assert Q_expected.shape == (self.batch_size, self.num_tau, 1)
 
             # Quantile Huber loss
             td_error = Q_targets - Q_expected
             loss_v = torch.abs(td_error).sum(dim=1).mean(dim=1).data
-            #assert td_error.shape == (self.batch_size, self.num_tau, self.num_tau), "wrong td error shape"
+            # assert td_error.shape == (self.batch_size, self.num_tau, self.num_tau), "wrong td error shape"
             huber_l = calculate_huber_loss(td_error, 1.0, self.num_tau)
             quantil_l = abs(taus - (td_error.detach() < 0).float()) * huber_l / 1.0
 
@@ -746,37 +847,134 @@ class Agent:
 
             loss = loss.mean()
 
-        if self.per:
-            if self.num_envs > 1 and self.per_splits > 1:
-                idxs = np.split(idxs, self.per_splits)
-                loss_v = torch.split(loss_v, self.batch_size // self.per_splits)
-                for i in range(self.per_splits):
-                    self.memories[mems[i]].update_priorities(idxs[i], loss_v[i].cpu().detach().numpy())
-            else:
-                self.memories[mem].update_priorities(idxs, loss_v.cpu().detach().numpy())
+        if self.chain:
+            self.running_Q_loss += loss
+            self.perform_chain(loss)
 
-        # if self.per:
-        #     new_priorities = np.abs(loss_v.detach().cpu().numpy()) + 1e-6  # 1e-6 is the epsilon in PER
-        #     self.buffer.update_priorities(indices, new_priorities)
+        self.memory.update_priorities(idxs, loss_v.cpu().detach().numpy())
+
+        if self.analytics:
+            with torch.no_grad():
+                self.analytic_object.add_loss(loss.cpu().detach())
 
         loss.backward()
 
-        torch.nn.utils.clip_grad_norm_(self.net.parameters(), 10)
+        if self.analytics:
+            with torch.no_grad():
+                grad_magnitude = self.compute_gradient_magnitude()
+                self.analytic_object.add_grad_mag(grad_magnitude.cpu().detach().item())
+
+                self.all_grad_mag += grad_magnitude.cpu().detach().item()
+
+                if not self.iqn:
+                    qvals = Q_expected
+                elif self.munchausen:
+                    qvals = q_k_target.mean(dim=1)
+                else:
+                    qvals = Q_expected.mean(dim=1)
+                self.analytic_object.add_qvals(qvals.cpu().detach())
+
+                if self.grad_steps % 1 == 0:
+                    _, churn_states, _, _, _, _, _ = self.memory.sample(self.batch_size)
+
+                    churn_qvals_before = self.net.qvals(churn_states)
+                    churn_actions_before = T.argmax(churn_qvals_before, dim=1).cpu()
+
+        torch.nn.utils.clip_grad_norm_(self.net.parameters(), self.grad_clip)
         self.optimizer.step()
 
-        if self.lr_decay:
-            self.scheduler.step()
+        if self.analytics and self.grad_steps % 1 == 0:
+            with torch.no_grad():
+                churn_qvals_after = self.net.qvals(churn_states)
+                churn_actions_after = T.argmax(churn_qvals_after, dim=1).cpu()
+
+                difference = torch.mean(churn_qvals_after - churn_qvals_before, dim=0)
+                self.analytic_object.add_churn_dif(difference.cpu().detach())
+
+                difference_actions = torch.sum((churn_actions_before != churn_actions_after).int(), dim=0)
+                policy_churn = difference_actions / self.batch_size
+
+                self.analytic_object.add_churn(policy_churn.cpu().detach().item())
+                self.tot_churns += 1
+                self.cum_churns += policy_churn.cpu().detach().item()
+
+                print(f"Churns: {self.cum_churns / self.tot_churns}")
+
+                self.analytic_object.add_churn_actions(actions.cpu().detach())
 
         self.grad_steps += 1
         if self.grad_steps % 10000 == 0:
             print("Completed " + str(self.grad_steps) + " gradient steps")
 
+    def perform_chain(self, loss):
+        if self.chain_qvals is not None:
+            new_qvals = self.net.qvals(self.chain_refs)
+            #new_argmaxs = torch.argmax(new_qvals, dim=1)
+
+            coef = self.chain_adapt_beta * ((self.running_Q_loss / self.grad_steps) / (self.running_penalty / self.grad_steps))
+
+            errors = (new_qvals - self.chain_qvals)**2
+            errors = torch.mean(errors, dim=1)
+            errors = torch.mean(errors, dim=0).item()
+            chain_loss = (1/self.chain_bs) * errors
+
+            self.running_penalty += chain_loss
+            print(coef * chain_loss)
+
+            loss += coef * chain_loss
+            #loss += self.chain_pi_coef * torch.sum(self.chain_argmaxs != new_argmaxs) * (1/self.chain_bs)
+
+        _, self.chain_refs, _, _, _, _, _ = self.memory.sample(self.chain_bs)
+
+        with torch.no_grad():
+            self.chain_qvals = self.net.qvals(self.chain_refs)
+            #self.chain_argmaxs = torch.argmax(self.chain_qvals, dim=1)
+
+        return loss
+
+    @torch.no_grad()
+    def calculate_parameter_norms(self, norm_type=2):
+        self.net.load_state_dict(self.net.state_dict())
+        # Dictionary to store the norms
+        norms = {}
+        # Iterate through all named parameters
+        for name, param in self.net.named_parameters():
+            if 'weight' in name:
+                # Calculate the norm of the parameter
+                norm = torch.norm(param, p=norm_type).item()  # .item() converts a one-element tensor to a scalar
+                # Store the norm in the dictionary
+                norms[name] = norm
+
+        norms_tot = 0
+        count = 0
+        for key, value in norms.items():
+            count += 1
+            norms_tot += value
+
+        norms_tot /= count
+
+        return norms_tot
+
+    def compute_gradient_magnitude(self):
+        # Calculate the magnitude of the average gradient
+        total_grad = 0.0
+        total_params = 0
+
+        for param in self.net.parameters():
+            if param.grad is not None:
+                param_grad = param.grad.data
+                total_grad += torch.sum(torch.abs(param_grad))
+                total_params += param_grad.numel()
+
+        average_grad_magnitude = total_grad / total_params
+        return average_grad_magnitude
 
     def calculate_trust_regions(self, loss, loss_v, states, actions, Q_expected, Q_targets):
         with torch.no_grad():
             if self.running_std != -999:
                 current_std = torch.std(loss_v).item()
                 self.running_std += current_std
+
 
                 q_k_tgt_net, taus = self.tgt_net(states)
                 target_network_pred = q_k_tgt_net.gather(2,
@@ -827,13 +1025,21 @@ class Agent:
                 return loss
 
 
-def calculate_huber_loss(td_errors, k=1.0,taus=8):
+def calculate_huber_loss(td_errors, k=1.0, taus=8):
     """
     Calculate huber loss element-wisely depending on kappa k.
     """
     loss = torch.where(td_errors.abs() <= k, 0.5 * td_errors.pow(2), k * (td_errors.abs() - 0.5 * k))
     assert loss.shape == (td_errors.shape[0], taus, taus), "huber loss has wrong shape"
     return loss
+
+def huber_loss(td_errors, k=1.0):
+    """
+    Calculate huber loss element-wisely depending on kappa k.
+    """
+    loss = torch.where(td_errors.abs() <= k, 0.5 * td_errors.pow(2), k * (td_errors.abs() - 0.5 * k))
+    return loss
+
 
 def distr_projection(next_distr, rewards, dones, Vmin, Vmax, n_atoms, gamma):
     """

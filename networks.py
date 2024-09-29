@@ -11,7 +11,8 @@ from torch.nn import init
 import torch.nn.functional as F
 import numpy as np
 import time
-from torchvision.utils import save_image
+from encoder import MobileNetV3Encoder, Impala3D, convnextv2_atto, convnextv2_RL
+#from torchvision.utils import save_image
 
 class NoisyLinear(nn.Module):
   def __init__(self, in_features, out_features, std_init=0.5):
@@ -56,7 +57,7 @@ class NoisyLinear(nn.Module):
 
 class FactorizedNoisyLinear(nn.Module):
     """ The factorized Gaussian noise layer for noisy-nets dqn. """
-    def __init__(self, in_features: int, out_features: int, sigma_0=0.5) -> None:
+    def __init__(self, in_features: int, out_features: int, sigma_0=0.5, self_norm=False) -> None:
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
@@ -72,8 +73,13 @@ class FactorizedNoisyLinear(nn.Module):
         self.bias_sigma = nn.Parameter(torch.empty(out_features))
         self.register_buffer('bias_epsilon', torch.empty(out_features))
 
-        self.reset_parameters()
+        if self_norm:
+            self.reset_parameters_self_norm()
+        else:
+            self.reset_parameters()
         self.reset_noise()
+
+        self.disable_noise()
 
     @torch.no_grad()
     def reset_parameters(self) -> None:
@@ -85,6 +91,16 @@ class FactorizedNoisyLinear(nn.Module):
 
         init.constant_(self.weight_sigma, self.sigma_0 * scale)
         init.constant_(self.bias_sigma, self.sigma_0 * scale)
+
+    @torch.no_grad()
+    def reset_parameters_self_norm(self) -> None:
+        # initialization is similar to Kaiming uniform (He. initialization) with fan_mode=fan_in
+
+        nn.init.normal_(self.weight_mu, std=1 / math.sqrt(self.out_features))
+        if self.bias_mu is not None:
+            fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.weight_mu)
+            bound = 1 / math.sqrt(fan_in)
+            nn.init.uniform_(self.bias_mu, -bound, bound)
 
     @torch.no_grad()
     def _get_noise(self, size: int) -> Tensor:
@@ -118,7 +134,7 @@ class NatureIQN(nn.Module):
     Implementation of the large variant of the IMPALA CNN introduced in Espeholt et al. (2018).
     """
     def __init__(self, in_depth, actions, device='cuda:0',
-                 noisy=True, num_tau=8, linear_size=512):
+                 noisy=True, num_tau=8, linear_size=512, non_factorised=False, dueling=True):
         super().__init__()
 
         self.start = time.time()
@@ -127,8 +143,10 @@ class NatureIQN(nn.Module):
         self.noisy = noisy
         self.linear_size = linear_size
 
-        if noisy:
+        if noisy and not non_factorised:
             linear_layer = FactorizedNoisyLinear
+        elif noisy:
+            linear_layer = NoisyLinear
         else:
             linear_layer = nn.Linear
 
@@ -152,14 +170,19 @@ class NatureIQN(nn.Module):
 
         activation = nn.ReLU
 
-        self.dueling = Dueling(
-            nn.Sequential(linear_layer(self.conv_out_size, self.linear_size),
-                          activation(),
-                          linear_layer(self.linear_size, 1)),
-            nn.Sequential(linear_layer(self.conv_out_size, self.linear_size),
-                          activation(),
-                          linear_layer(self.linear_size, actions))
-        )
+        if dueling:
+            self.dueling = Dueling(
+                nn.Sequential(linear_layer(self.conv_out_size, self.linear_size),
+                              activation(),
+                              linear_layer(self.linear_size, 1)),
+                nn.Sequential(linear_layer(self.conv_out_size, self.linear_size),
+                              activation(),
+                              linear_layer(self.linear_size, actions))
+            )
+        else:
+            self.fc1 = linear_layer(self.conv_out_size, self.linear_size)
+            self.fc2 = linear_layer(self.linear_size, self.actions)
+            self.dueling = False
 
         self.to(device)
 
@@ -202,8 +225,12 @@ class NatureIQN(nn.Module):
         # pass through final hidden layers
         #x = torch.relu(self.fc1(x))
         #out = self.fc2(x)
-
-        out = self.dueling(x, advantages_only=advantages_only)
+        if self.dueling is not False:
+            out = self.dueling(x, advantages_only=advantages_only)
+        else:
+            # pass through final hidden layers
+            x = torch.relu(self.fc1(x))
+            out = self.fc2(x)
 
         return out.view(batch_size, self.num_tau, self.actions), taus
 
@@ -321,22 +348,27 @@ class ImpalaCNNBlock(nn.Module):
     """
     Three of these blocks are used in the large IMPALA CNN.
     """
-    def __init__(self, depth_in, depth_out, norm_func, activation=nn.ReLU):
+    def __init__(self, depth_in, depth_out, norm_func, activation=nn.ReLU, layer_norm=False,
+                 layer_norm_shapes=False):
         super().__init__()
+        self.layer_norm = layer_norm
 
         self.conv = nn.Conv2d(in_channels=depth_in, out_channels=depth_out, kernel_size=3, stride=1, padding=1)
         self.max_pool = nn.MaxPool2d(3, 2, padding=1)
+
+        if self.layer_norm:
+            self.norm_layer1 = nn.LayerNorm(layer_norm_shapes[0])
+            #self.norm_layer2 = nn.LayerNorm(layer_norm_shapes[1])
+
         self.residual_0 = ImpalaCNNResidual(depth_out, norm_func=norm_func, activation=activation)
         self.residual_1 = ImpalaCNNResidual(depth_out, norm_func=norm_func, activation=activation)
 
     #@torch.autocast('cuda')
     def forward(self, x):
         x = self.conv(x)
-        #if x.abs().sum().item() == 0:
-        #raise Exception("Tensor output all zeros")
-        #This bug still exists -- this sometimes outputs all 0s
-        # Bug is now FIXED (I HOPE, it still lives in my nightmares)
-        #turned out it in choose action? had to do action.cpu
+
+        if self.layer_norm:
+            x = self.norm_layer1(x)
 
         #raise Exception("Array of 0s!")
         #print(x.abs().sum().item())
@@ -345,6 +377,9 @@ class ImpalaCNNBlock(nn.Module):
         x = self.residual_0(x)
 
         x = self.residual_1(x)
+
+        #if self.layer_norm:
+        #x = self.norm_layer2(x)
 
         return x
 
@@ -393,7 +428,7 @@ class ImpalaCNNLarge(nn.Module):
             else:
                 raise Exception("No Conv out size for this maxpool size")
         else:
-            self.conv_out_size = 11520
+            self.conv_out_size = 32 * model_size * 11 * 11
 
         self.dueling = Dueling(
             nn.Sequential(linear_layer(self.conv_out_size, self.linear_size),
@@ -442,7 +477,7 @@ class ImpalaCNNLargeC51(nn.Module):
     No IQN
     """
     def __init__(self, in_depth, actions, model_size=2, spectral=True, atoms=51, Vmin=-10, Vmax=10, device='cuda:0',
-                 noisy=False, maxpool=False):
+                 noisy=False, maxpool=False, linear_size=512):
         super().__init__()
 
         self.start = time.time()
@@ -452,8 +487,7 @@ class ImpalaCNNLargeC51(nn.Module):
         self.device = device
         self.noisy = noisy
         self.maxpool = maxpool
-        if not self.c51:
-            self.atoms = 1
+        self.linear_size = linear_size
 
         if spectral:
             spectral_norm = 'all'
@@ -475,21 +509,21 @@ class ImpalaCNNLargeC51(nn.Module):
         )
 
         if self.maxpool:
-            self.pool = torch.nn.AdaptiveMaxPool2d((8, 8))
+            self.pool = torch.nn.AdaptiveMaxPool2d((6, 6))
             conv_out_size = 2048*model_size
         else:
-            conv_out_size = 11520
+            conv_out_size = 7744
 
         if not self.noisy:
-            self.fc1V = nn.Linear(conv_out_size, 256)
-            self.fc1A = nn.Linear(conv_out_size, 256)
-            self.fcV2 = nn.Linear(256, self.atoms)
-            self.fcA2 = nn.Linear(256, actions * self.atoms)
+            self.fc1V = nn.Linear(conv_out_size, linear_size)
+            self.fc1A = nn.Linear(conv_out_size, linear_size)
+            self.fcV2 = nn.Linear(linear_size, self.atoms)
+            self.fcA2 = nn.Linear(linear_size, actions * self.atoms)
         else:
-            self.fc1V = NoisyLinear(conv_out_size, 256)
-            self.fc1A = NoisyLinear(conv_out_size, 256)
-            self.fcV2 = NoisyLinear(256, self.atoms)
-            self.fcA2 = NoisyLinear(256, actions * self.atoms)
+            self.fc1V = NoisyLinear(conv_out_size, linear_size)
+            self.fc1A = NoisyLinear(conv_out_size, linear_size)
+            self.fcV2 = NoisyLinear(linear_size, self.atoms)
+            self.fcA2 = NoisyLinear(linear_size, actions * self.atoms)
 
         self.register_buffer("supports", torch.arange(Vmin, Vmax+DELTA_Z, DELTA_Z))
         self.softmax = nn.Softmax(dim=1)
@@ -518,33 +552,19 @@ class ImpalaCNNLargeC51(nn.Module):
         return x
 
     def forward(self, x):
-        if self.c51:
-            batch_size = x.size()[0]
-            fx = x.float() / 256
-            conv_out = self.conv(fx)
-            if self.maxpool:
-                conv_out = self.pool(conv_out)
+        batch_size = x.size()[0]
+        fx = x.float() / 255
+        conv_out = self.conv(fx)
+        if self.maxpool:
+            conv_out = self.pool(conv_out)
 
-            conv_out = conv_out.view(batch_size, -1)
+        conv_out = conv_out.view(batch_size, -1)
 
-            val_out = self.fc_val(conv_out).view(batch_size, 1, self.atoms)
-            adv_out = self.fc_adv(conv_out).view(batch_size, -1, self.atoms)
-            adv_mean = adv_out.mean(dim=1, keepdim=True)
-            return val_out + (adv_out - adv_mean)
-        else:
-            x = x.float() / 256
-            batch_size = x.size()[0]
+        val_out = self.fc_val(conv_out).view(batch_size, 1, self.atoms)
+        adv_out = self.fc_adv(conv_out).view(batch_size, -1, self.atoms)
+        adv_mean = adv_out.mean(dim=1, keepdim=True)
+        return val_out + (adv_out - adv_mean)
 
-            f = self.conv(x)
-            if self.maxpool:
-                f = self.pool(f)
-
-            f = f.view(batch_size, -1)
-
-            V = self.fc_val(f)
-            A = self.fc_adv(f)
-            Q = V + A - A.mean(dim=1, keepdim=True)
-            return Q
 
     def both(self, x):
         cat_out = self(x)
@@ -553,22 +573,19 @@ class ImpalaCNNLargeC51(nn.Module):
         res = weights.sum(dim=2)
         return cat_out, res
 
-    def qvals(self, x):
-        if self.c51:
-            return self.both(x)[1]
-        else:
-            return self(x)
+    def qvals(self, x, advantages_only=False):
+        return self.both(x)[1]
 
     def apply_softmax(self, t):
         return self.softmax(t.view(-1, self.atoms)).view(t.size())
 
-    def save_checkpoint(self):
+    def save_checkpoint(self, name):
         #print('... saving checkpoint ...')
-        torch.save(self.state_dict(), "current_model3Ruins" + str(int(time.time() - self.start)))
+        torch.save(self.state_dict(), name + ".model")
 
-    def load_checkpoint(self):
+    def load_checkpoint(self, name):
         #print('... loading checkpoint ...')
-        self.load_state_dict(torch.load("finalAllTracks"))
+        self.load_state_dict(torch.load(name))
 
 
 class ImpalaCNNLargeIQN(nn.Module):
@@ -577,7 +594,8 @@ class ImpalaCNNLargeIQN(nn.Module):
     """
     def __init__(self, in_depth, actions, model_size=2, spectral=True, device='cuda:0',
                  noisy=False, maxpool=False, num_tau=8, maxpool_size=6, dueling=True,
-                 linear_size=512, spectral_lin=False, ncos=64):
+                 linear_size=512, ncos=64, arch="impala", layer_norm=False,
+                 activation="relu"):
         super().__init__()
 
         self.start = time.time()
@@ -589,20 +607,30 @@ class ImpalaCNNLargeIQN(nn.Module):
         self.dueling = dueling
         self.in_depth = in_depth
 
+        self.activation = activation
+        if self.activation == "relu":
+            conv_activation = nn.ReLU
+            activation = nn.ReLU
+        elif self.activation == "gelu":
+            activation = nn.GELU
+            conv_activation = nn.GELU
+        elif self.activation == "prelu":
+            activation = nn.PReLU
+            conv_activation = nn.PReLU
+        elif self.activation == "selu":
+            activation = nn.SELU
+            conv_activation = nn.ReLU
+
         self.linear_size = linear_size
         self.num_tau = num_tau
 
         self.maxpool_size = maxpool_size
 
-        self.spectral_lin = spectral_lin
-
-        activation = nn.ReLU
-
-        if spectral_lin:
-            spec = torch.nn.utils.parametrizations.spectral_norm
+        self.layer_norm = layer_norm
 
         self.n_cos = ncos
         self.pis = torch.FloatTensor([np.pi * i for i in range(self.n_cos)]).view(1, 1, self.n_cos).to(device)
+        self.arch = arch
 
         if noisy:
             linear_layer = FactorizedNoisyLinear
@@ -616,30 +644,40 @@ class ImpalaCNNLargeIQN(nn.Module):
         else:
             norm_func = identity
 
-        self.conv = nn.Sequential(
-            ImpalaCNNBlock(in_depth, 16*model_size, norm_func=norm_func, activation=activation),
-            ImpalaCNNBlock(16*model_size, 32*model_size, norm_func=norm_func, activation=activation),
-            ImpalaCNNBlock(32*model_size, 32*model_size, norm_func=norm_func, activation=activation),
-            nn.ReLU()
-        )
+        if arch == "impala":
+            self.conv = nn.Sequential(
+                ImpalaCNNBlock(in_depth, int(16*model_size), norm_func=norm_func, activation=conv_activation,
+                               layer_norm=self.layer_norm,
+                               layer_norm_shapes=([int(16*model_size), 84, 84], [int(16*model_size), 42, 42])),
+                ImpalaCNNBlock(int(16*model_size), int(32*model_size), norm_func=norm_func, activation=conv_activation,
+                                layer_norm=self.layer_norm,
+                               layer_norm_shapes=([int(32*model_size), 42, 42], [int(32*model_size), 21, 21])),
+                ImpalaCNNBlock(int(32*model_size), int(32*model_size), norm_func=norm_func, activation=conv_activation,
+                                layer_norm=self.layer_norm,
+                               layer_norm_shapes=([int(32*model_size), 21, 21], [int(32*model_size), 11, 11])),
+                nn.ReLU()
+            )
 
-        if self.maxpool:
-            self.pool = torch.nn.AdaptiveMaxPool2d((self.maxpool_size, self.maxpool_size))
-            if self.maxpool_size == 8:
-                self.conv_out_size = 2048*model_size
-            elif self.maxpool_size == 6:
-                self.conv_out_size = 1152*model_size
-            elif self.maxpool_size == 4:
-                self.conv_out_size = 512*model_size
+            if self.maxpool:
+                self.pool = torch.nn.AdaptiveMaxPool2d((self.maxpool_size, self.maxpool_size))
+                if self.maxpool_size == 8:
+                    self.conv_out_size = 2048 * model_size
+                elif self.maxpool_size == 6:
+                    self.conv_out_size = int(1152 * model_size)
+                elif self.maxpool_size == 4:
+                    self.conv_out_size = 512 * model_size
+                else:
+                    raise Exception("No Conv out size for this maxpool size")
             else:
-                raise Exception("No Conv out size for this maxpool size")
+                self.conv_out_size = int(32 * model_size * 11 * 11)
         else:
-            self.conv_out_size = 32*model_size*11*11
+            raise Exception("Encoder Architecture Not Found")
+
 
         self.cos_embedding = nn.Linear(self.n_cos, self.conv_out_size)
 
         if self.dueling:
-            if not spectral_lin:
+            if not self.layer_norm:
                 self.dueling = Dueling(
                     nn.Sequential(linear_layer(self.conv_out_size, self.linear_size),
                                   activation(),
@@ -652,26 +690,20 @@ class ImpalaCNNLargeIQN(nn.Module):
                 # torch.nn.utils.parametrizations.spectral_norm
 
                 self.dueling = Dueling(
-                    nn.Sequential(spec(linear_layer(self.conv_out_size, self.linear_size)),
+                    nn.Sequential(linear_layer(self.conv_out_size, self.linear_size),
+                                  nn.LayerNorm(self.linear_size),
                                   activation(),
-                                  spec(linear_layer(self.linear_size, 1))),
-                    nn.Sequential(spec(linear_layer(self.conv_out_size, self.linear_size)),
+                                  linear_layer(self.linear_size, 1)),
+                    nn.Sequential(linear_layer(self.conv_out_size, self.linear_size),
+                                  nn.LayerNorm(self.linear_size),
                                   activation(),
-                                  spec(linear_layer(self.linear_size, actions)))
+                                  linear_layer(self.linear_size, actions))
                 )
         else:
-            if not self.spectral_lin:
-                self.linear_layers = nn.Sequential(
+            self.linear_layers = nn.Sequential(
                     linear_layer(self.conv_out_size, self.linear_size),
                     activation(),
-                    linear_layer(self.linear_size, actions)
-                )
-            else:
-                self.linear_layers = nn.Sequential(
-                    spec(linear_layer(self.conv_out_size, self.linear_size)),
-                    activation(),
-                    spec(linear_layer(self.linear_size, actions))
-                )
+                    linear_layer(self.linear_size, actions))
 
         self.to(device)
 
@@ -689,18 +721,20 @@ class ImpalaCNNLargeIQN(nn.Module):
         taus [shape of ((batch_size, num_tau, 1))]
 
         """
+        batch_size = inputt.size()[0]
+        if self.arch == "each_frame":
+            inputt = inputt.reshape((-1, 1, 84, 84))
+
         #print("Forward Func")
         inputt = inputt.float() / 255
         #print(input.abs().sum().item())
-        batch_size = inputt.size()[0]
 
         x = self.conv(inputt)
         #print(x.device)
-        if self.maxpool:
+        if self.maxpool and (self.arch == "impala" or self.arch == "each_frame" or self.arch == "3d"):
             x = self.pool(x)
 
         #print(x.device)
-
         x = x.view(batch_size, -1)
 
         cos, taus = self.calc_cos(batch_size, self.num_tau)  # cos shape (batch, num_tau, layer_size)
@@ -710,7 +744,6 @@ class ImpalaCNNLargeIQN(nn.Module):
         # x has shape (batch, layer_size) for multiplication –> reshape to (batch, 1, layer)
         x = (x.unsqueeze(1) * cos_x).view(batch_size * self.num_tau, self.conv_out_size)
 
-
         if self.dueling:
             out = self.dueling(x, advantages_only=advantages_only)
         else:
@@ -719,8 +752,6 @@ class ImpalaCNNLargeIQN(nn.Module):
         #print(out.device)
         return out.view(batch_size, self.num_tau, self.actions), taus
 
-
-    #@torch.autocast('cuda')
     def qvals(self, inputs, advantages_only=False):
         quantiles, _ = self.forward(inputs, advantages_only)
 
@@ -745,4 +776,134 @@ class ImpalaCNNLargeIQN(nn.Module):
     def load_checkpoint(self, name):
         #print('... loading checkpoint ...')
         self.load_state_dict(torch.load(name))
+
+
+class BTR_RNN(nn.Module):
+    """
+    Implementation of the large variant of the IMPALA CNN introduced in Espeholt et al. (2018).
+    """
+    def __init__(self, in_depth, actions, model_size=2, spectral=True, device='cuda:0',
+                maxpool=True, maxpool_size=6, dueling=True, linear_size=512, seq_len=40, imagex=84, imagey=84):
+        super().__init__()
+
+        self.start = time.time()
+        self.model_size = model_size
+        self.actions = actions
+        self.device = device
+        self.maxpool = maxpool
+        self.dueling = dueling
+        self.in_depth = in_depth
+
+        self.imagex = imagex
+        self.imagey = imagey
+
+        self.linear_size = linear_size
+
+        self.maxpool_size = maxpool_size
+
+        self.hidden_size = linear_size
+
+        self.seq_len = seq_len
+
+        activation = nn.ReLU
+
+        def identity(p): return p
+
+        if spectral:
+            norm_func = torch.nn.utils.parametrizations.spectral_norm
+        else:
+            norm_func = identity
+
+        self.conv = nn.Sequential(
+            ImpalaCNNBlock(in_depth, int(16*model_size), norm_func=norm_func, activation=activation),
+            ImpalaCNNBlock(int(16*model_size), int(32*model_size), norm_func=norm_func, activation=activation),
+            ImpalaCNNBlock(int(32*model_size), int(32*model_size), norm_func=norm_func, activation=activation),
+            nn.ReLU()
+        )
+
+        if self.maxpool:
+            self.pool = torch.nn.AdaptiveMaxPool2d((self.maxpool_size, self.maxpool_size))
+            if self.maxpool_size == 8:
+                self.conv_out_size = 2048*model_size
+            elif self.maxpool_size == 6:
+                self.conv_out_size = int(1152*model_size)
+            elif self.maxpool_size == 4:
+                self.conv_out_size = 512*model_size
+            else:
+                raise Exception("No Conv out size for this maxpool size")
+        else:
+            self.conv_out_size = 32*model_size*11*11
+
+        self.torso = nn.Linear(self.conv_out_size, self.linear_size)
+
+        self.lstm = nn.LSTM(self.linear_size, self.linear_size, num_layers=1, batch_first=True)
+
+        #self.fcA = nn.Linear(self.linear_size, actions)
+        #self.fcV = nn.Linear(self.linear_size, 1)
+
+        self.V = nn.Sequential(nn.Linear(self.linear_size, self.linear_size),
+                          activation(), nn.Linear(self.linear_size, 1))
+
+        self.A = nn.Sequential(nn.Linear(self.linear_size, self.linear_size),
+                          activation(), nn.Linear(self.linear_size, actions))
+
+        self.to(device)
+
+    #@torch.autocast('cuda')
+    def forward(self, inputt, hiddens, advantages_only=False):
+        # hiddens should be shape (1, batch_size, linear_size)
+
+        # input should be batchsize, seq_len, framestack, x, y
+
+        out, hiddens = self.get_lstm_out(inputt, hiddens)
+        #print("LSTM outputs shapes")
+        #print(out.shape)
+        #print(hiddens[0].shape)
+
+        #print("out shape")
+        # should be (seq_len, hidden size)
+        #print(out.shape)
+
+        A = self.A(out)
+        if advantages_only:
+            return A, hiddens
+
+        V = self.V(out)
+
+        return V + (A - torch.mean(A, dim=2, keepdim=True)), hiddens
+
+    def get_lstm_out(self, inputt, hiddens):
+
+        inputt = inputt.float() / 255
+        batch_size = inputt.size()[0]
+        seq_len = inputt.size()[1]
+        #print(f"batch size: {batch_size}")
+        #print(f"Seq Len: {seq_len}")
+
+        conv_in = inputt.reshape(batch_size * seq_len, self.in_depth, self.imagex, self.imagey)
+
+        #print(f"conv input: {conv_in.shape}")
+
+        x = self.conv(conv_in)
+
+        if self.maxpool:
+            x = self.pool(x)
+
+        x = x.reshape(batch_size, seq_len, -1)
+        #print(f"conv output: {x.shape}")
+        x = self.torso(x)
+        #print(f"torso output: {x.shape}")
+        h0, c0 = hiddens
+
+        return self.lstm(x, (h0, c0))
+
+    def save_checkpoint(self, name):
+        #print('... saving checkpoint ...')
+        torch.save(self.state_dict(), name + ".model")
+
+    def load_checkpoint(self, name):
+        #print('... loading checkpoint ...')
+        self.load_state_dict(torch.load(name))
+
+
 
