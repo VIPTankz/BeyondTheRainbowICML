@@ -15,11 +15,8 @@ from copy import deepcopy
 from functools import partial
 from Analytic import Analytics
 import matplotlib.pyplot as plt
-from utils import cal_dormant_ratio, TruncatedNormal, perturb
 import math
 from collections import defaultdict
-from sam import SAM
-import torchvision.transforms.functional as TF
 
 
 class EpsilonGreedy:
@@ -86,17 +83,6 @@ def create_network(impala, iqn, input_dims, n_actions, spectral_norm, device, no
                          non_factorised=non_factorised, dueling=dueling)
 
 
-def apply_pruning(net, apply_sparsity):
-    for name, module in net.named_modules():
-        if name.endswith("2") or name == "cos_embedding" or name.startswith("conv.0"):
-            continue
-
-        if isinstance(module, nn.Conv2d) or isinstance(module, nn.Linear):
-            torch.nn.utils.prune.l1_unstructured(module, name='weight', amount=apply_sparsity)
-        elif isinstance(module, FactorizedNoisyLinear):
-            torch.nn.utils.prune.l1_unstructured(module, name='weight_mu', amount=apply_sparsity)
-            torch.nn.utils.prune.l1_unstructured(module, name='weight_sigma', amount=apply_sparsity)
-
 
 class Agent:
     def __init__(self, n_actions, input_dims, device, num_envs, agent_name, total_frames, testing=False, batch_size=256
@@ -132,17 +118,6 @@ class Agent:
         self.procgen = True if input_dims[1] == 64 else False
         self.grad_clip = grad_clip
 
-        self.chain = chain
-        if self.chain:
-            self.chain_bs = 64
-            self.chain_qvals = None
-            self.chain_argmaxs = None
-            self.chain_refs = None
-
-            self.running_Q_loss = 0
-            self.running_penalty = 1
-            self.chain_adapt_beta = 0.05
-
         self.n_actions = n_actions
         self.input_dims = input_dims
         self.device = device
@@ -150,17 +125,7 @@ class Agent:
         self.testing = testing
         self.activation = activation
 
-        self.pessimistic = pessimistic
-        if self.pessimistic:
-            self.pess_scale = 25
-
-        self.selfnorm = selfnorm
-        if self.selfnorm:
-            self.activation = "selu"
         self.layer_norm = layer_norm
-
-        self.perturb = perturb
-
 
         self.loading_checkpoint = False
 
@@ -198,22 +163,9 @@ class Agent:
         self.action_space = [i for i in range(self.n_actions)]
         self.learn_step_counter = 0
 
-        if self.perturb:
-            # perturb once every million frames
-            self.perturb_every = int(self.total_grad_steps / ((total_frames*4) / 1000000))
-
-        self.chkpt_dir = ""
-
         self.n = n
-        if discount_anneal:
-            self.discount_anneal = True
-            self.gamma = 0.97
-            self.final_gamma = 0.997
-            self.annealing_period = self.total_grad_steps // 2  # first half of training
-            self.gamma_inc = (self.final_gamma - self.gamma) / self.annealing_period
-        else:
-            self.gamma = discount
-            self.discount_anneal = False
+
+        self.gamma = discount
         self.batch_size = batch_size
 
         self.model_size = model_size  # Scaling of IMPALA network
@@ -228,10 +180,6 @@ class Agent:
         # to perform the same and is faster
         self.non_factorised = non_factorised
 
-        self.per_splits = 1
-        if self.per_splits > num_envs:
-            self.per_splits = num_envs
-
         self.impala = impala  # non impala only implemented for iqn
         self.dueling = dueling
 
@@ -240,8 +188,6 @@ class Agent:
         self.iqn = iqn
 
         self.ncos = ncos
-
-        self.adamw = adamw
 
         self.double = double  # Not implemented for IQN and Munchausen
         self.maxpool = maxpool
@@ -257,36 +203,8 @@ class Agent:
         # 1 Million rounded to the nearest power of 2 for tree implementation
         self.max_mem_size = max_mem_size
 
-        self.soft_update_tau = ema_tau  # 0.001 for non-sample-eff
-        self.replace_target_cnt = target_replace  # This is the number of grad steps - could be a little jank
+        self.replace_target_cnt = target_replace
         # when changing num_envs/batch size/replay ratio
-
-
-        # target_net, ema, trust_region
-        if ema:
-            self.stabiliser = "ema"
-        elif trust_regions:
-            self.stabiliser = "trust_regions"
-            self.tr_period = 1500
-        else:
-            self.stabiliser = "target"
-
-        if self.stabiliser == "ema":
-            self.soft_updates = True
-        else:
-            self.soft_updates = False
-
-        # NOT IMPLEMENTED
-        if self.stabiliser == "trust_regions":
-            self.trust_regions = True
-            self.running_std = -999
-        else:
-            self.trust_regions = False
-
-
-        # Best used value is 32000 frames per replace. For bs 256, this is 500. For bs 16, this is every 8000!
-
-        self.tr_alpha = 1
 
         self.loss_type = "huber"  # This is only for non-iqn, non-munchausen, c51
         if self.loss_type == "huber":
@@ -321,14 +239,6 @@ class Agent:
         self.linear_size = linear_size
         self.arch = arch
 
-        # self.memories = []
-        # if self.per:
-        #     for i in range(num_envs):
-        #         self.memories.append(ReplayMemory(self.max_mem_size // num_envs, self.n, self.gamma, device, alpha=self.per_alpha, beta=self.per_beta, procgen=self.procgen))
-        # else:
-        #     for i in range(num_envs):
-        #         self.memories.append(RegularReplayMemory(self.max_mem_size // num_envs, self.n, self.gamma, device))
-
         self.framestack = framestack
         self.rgb = rgb
         self.memory = PER(self.max_mem_size, device, self.n, num_envs, self.gamma, alpha=self.per_alpha,
@@ -345,17 +255,7 @@ class Agent:
         self.net = self.network_creator_fn()
         self.tgt_net = self.network_creator_fn()
 
-        self.sam = sam
-        if self.adamw:
-            self.optimizer = optim.AdamW(self.net.parameters(), lr=self.lr, eps=0.005 / self.batch_size,
-                                         weight_decay=1e-4)  # weight decay taken from museli
-        elif self.selfnorm:
-            self.optimizer = optim.Adam(self.net.parameters(), lr=self.lr, betas=(0.9, 0.99), eps=0.01)
-        elif self.sam:
-            base_optimizer = optim.Adam
-            self.optimizer = SAM(self.net.parameters(), base_optimizer, lr=self.lr, eps=0.005 / self.batch_size)
-        else:
-            self.optimizer = optim.Adam(self.net.parameters(), lr=self.lr, eps=0.005 / self.batch_size)  # 0.00015
+        self.optimizer = optim.Adam(self.net.parameters(), lr=self.lr, eps=0.005 / self.batch_size)  # 0.00015
 
         self.net.train()
 
@@ -372,53 +272,6 @@ class Agent:
 
         if self.loading_checkpoint:
             self.load_models("insert_model_name")
-
-        self.tot_churns = 0
-        self.cum_churns = 0
-        self.all_grad_mag = 0
-        self.last_acts = [0 for i in range(self.num_envs)]
-        self.tot_avgs = 0
-        self.tot_swaps = 0
-        self.cum_act_gap = 0
-
-        self.prune = pruning
-        #if self.prune and self.spectral_norm:
-        #raise Exception("Cannot use both pruning and spectral norm")
-        if self.prune:
-            self.desired_sparsity = 0.95
-            self.last_sparsity = 0.
-            self.start_prune = 0.2
-            self.end_prune = 0.8
-
-            # this ensures the hooks are set up
-            apply_pruning(self.tgt_net, 0.0)
-            apply_pruning(self.net, 0.0)
-
-    def prune_network(self):
-        # applies pruning
-        # doesn't apply to first and last layers
-        # doesn't work with spec norm, and untested with NoisyLayers
-        current_progress = self.grad_steps / self.total_grad_steps
-
-        if current_progress < self.start_prune or current_progress > self.end_prune:
-            return
-
-        cur_sparsity = self.desired_sparsity * \
-                       (1 - (1 - (current_progress - self.start_prune) / (self.end_prune - self.start_prune)) ** 3)
-
-        apply_sparsity = (cur_sparsity - self.last_sparsity) / (1 - self.last_sparsity)
-
-        # print("Applied Sparsity")
-        # print(apply_sparsity)
-        #
-        # print("Target Sparsity")
-        # print(cur_sparsity)
-
-        apply_pruning(self.net, apply_sparsity)
-
-        self.last_sparsity = cur_sparsity
-
-
 
     def get_grad_steps(self):
         return self.grad_steps
@@ -447,16 +300,6 @@ class Agent:
 
             state = T.tensor(observation, dtype=int).to(self.net.device)
 
-            ####################
-            # for i in range(len(state)):
-            #     # Apply transformations to each frame in the sequence
-            #     for j in range(4):  # Assuming 4 is the second dimension representing frames
-            #         state[i, j] = TF.adjust_brightness(state[i, j], 0.1)
-            #         state[i, j] = TF.adjust_saturation(state[i, j], 0.1)
-            #         state[i, j] = TF.adjust_hue(state[i, j], 0.1)
-            #         #state[i, j] = TF.adjust_contrast(state[i, j], 0.1)
-            ####################################
-
             state = T.tensor(observation, dtype=T.float).to(self.net.device)
 
             if self.stoch:
@@ -466,21 +309,6 @@ class Agent:
             else:
                 qvals = self.net.qvals(state, advantages_only=True)
                 x = T.argmax(qvals, dim=1).cpu()
-
-                ############### code for action swaps and action gaps
-                # for i in range(self.num_envs):
-                #     top2_vals = torch.topk(qvals[i], 2).values
-                #     self.cum_act_gap += torch.abs(top2_vals[0] - top2_vals[1])
-                #
-                #     if x[i] != self.last_acts[i]:
-                #         self.last_acts[i] = x[i]
-                #         self.tot_swaps += 1
-                #     self.tot_avgs += 1
-                # if np.random.random() > 0.99:
-                #     print(f"Action Swap Percent {self.tot_swaps / self.tot_avgs}")
-                #     print(f"Action Gap {self.cum_act_gap / self.tot_avgs}")
-                #     print()
-                ####################
 
             if self.env_steps < self.min_sampling_size or not self.noisy or \
                     (self.env_steps < self.total_frames / 2 and self.eps_disable):
@@ -512,28 +340,6 @@ class Agent:
         self.net.load_checkpoint(name)
         self.tgt_net.load_checkpoint(name)
 
-    def soft_update(self):
-        """Soft update model parameters.
-        θ_target = τ*θ_local + (1 - τ)*θ_target
-        Params
-        ======
-            local_model (PyTorch model): weights will be copied from
-            target_model (PyTorch model): weights will be copied to
-            tau (float): interpolation parameter
-        """
-        with torch.no_grad():
-            for target_param, local_param in zip(self.tgt_net.parameters(), self.net.parameters()):
-                target_param.data.copy_(
-                    self.soft_update_tau * local_param.data + (1.0 - self.soft_update_tau) * target_param.data)
-
-    def activation_hook(self, module, input, output):
-        if self.use_hooks:
-            if isinstance(output, tuple):
-                # If the output is a tuple, detach each element
-                self.activations[module].append(tuple(o.detach() for o in output))
-            else:
-                # If it's a single tensor, detach it directly
-                self.activations[module].append(output.detach())
     def learn(self):
         if self.replay_ratio < 1:
             if self.replay_ratio_cnt == 0:
@@ -548,49 +354,17 @@ class Agent:
         if self.env_steps < self.min_sampling_size:
             return
 
-        # if self.per:
-        #     for i in range(self.num_envs):
-        #         self.memories[i].priority_weight = min(self.memories[i].priority_weight + self.priority_weight_increase, 1)
-
         if self.per and self.per_beta_anneal:
             self.memory.beta = min(self.memory.beta + self.priority_weight_increase, 1)
-
-        if self.discount_anneal:
-            self.gamma = min(self.gamma + self.gamma_inc, self.final_gamma)
-            for i in self.memories:
-                i.discount = self.gamma
 
         if self.noisy:
             self.reset_noise(self.tgt_net)
 
-        if not self.soft_updates:
 
-            if self.trust_regions:
-                if self.grad_steps % self.tr_period == 0:
-                    self.replace_target_network()
-            else:
-                if self.grad_steps % self.replace_target_cnt == 0:
-                    self.replace_target_network()
-        else:
-            self.soft_update()
-
-        if self.prune:
-            self.prune_network()
-
-        if self.perturb and self.grad_steps % self.perturb_every == 0:
-            # this also resets the optimizer
-            perturb(self.net, self.optimizer, 0.2)
-            perturb(self.tgt_net, self.optimizer, 0.2)
-
-        # states, rewards, actions, next_states, dones, weights, idxs, mems, mem = self.sample()
-        # states, actions, rewards, next_states, dones, weights, idxs = self.memory.sample(self.batch_size)
+        if self.grad_steps % self.replace_target_cnt == 0:
+            self.replace_target_network()
 
         idxs, states, actions, rewards, next_states, dones, weights = self.memory.sample(self.batch_size)
-
-        if self.pessimistic:
-            rewards[dones] -= 1 * self.pess_scale
-            # Subtract 1/33.333 where bool_tensor is False
-            rewards[~dones] -= 1 / (333.333 / self.pess_scale)
 
         self.optimizer.zero_grad()
 
@@ -683,8 +457,6 @@ class Agent:
                 actions = actions.unsqueeze(1)
                 rewards = rewards.unsqueeze(1)
                 dones = dones.unsqueeze(1)
-                # if self.per:
-                #     weights = weights.unsqueeze(1)
 
                 Q_targets_next = self.tgt_net.forward(next_states)
 
@@ -728,12 +500,9 @@ class Agent:
 
             with torch.no_grad():
 
-                if self.trust_regions:
-                    Q_targets_next, _ = self.net(next_states)
-                else:
-                    Q_targets_next, _ = self.tgt_net(next_states)
+                Q_targets_next, _ = self.tgt_net(next_states)
 
-                if self.double:  # this may be wrong - seems to perform better without. Could just be chance though
+                if self.double:
                     indices = np.arange(self.batch_size)
                     q_actions = self.net.qvals(next_states)
                     max_actions = T.argmax(q_actions, dim=1)
@@ -774,18 +543,11 @@ class Agent:
             if self.per:
                 loss = loss * weights.to(self.net.device)
 
-            if self.trust_regions:
-                loss = self.calculate_trust_regions(loss, loss_v, states, actions, Q_expected, Q_targets)
-
             loss = loss.mean()
 
         elif self.iqn and self.munchausen:
             with torch.no_grad():
-
-                if self.trust_regions:
-                    Q_targets_next, _ = self.net(next_states)
-                else:
-                    Q_targets_next, _ = self.tgt_net(next_states)
+                Q_targets_next, _ = self.tgt_net(next_states)
 
                 # (batch, num_tau, actions)
                 q_t_n = Q_targets_next.mean(dim=1)
@@ -842,14 +604,7 @@ class Agent:
             if self.per:
                 loss = loss * weights.to(self.net.device)
 
-            if self.trust_regions:
-                loss = self.calculate_trust_regions(loss, loss_v, states, actions, Q_expected, Q_targets)
-
             loss = loss.mean()
-
-        if self.chain:
-            self.running_Q_loss += loss
-            self.perform_chain(loss)
 
         self.memory.update_priorities(idxs, loss_v.cpu().detach().numpy())
 
@@ -906,31 +661,6 @@ class Agent:
         if self.grad_steps % 10000 == 0:
             print("Completed " + str(self.grad_steps) + " gradient steps")
 
-    def perform_chain(self, loss):
-        if self.chain_qvals is not None:
-            new_qvals = self.net.qvals(self.chain_refs)
-            #new_argmaxs = torch.argmax(new_qvals, dim=1)
-
-            coef = self.chain_adapt_beta * ((self.running_Q_loss / self.grad_steps) / (self.running_penalty / self.grad_steps))
-
-            errors = (new_qvals - self.chain_qvals)**2
-            errors = torch.mean(errors, dim=1)
-            errors = torch.mean(errors, dim=0).item()
-            chain_loss = (1/self.chain_bs) * errors
-
-            self.running_penalty += chain_loss
-            print(coef * chain_loss)
-
-            loss += coef * chain_loss
-            #loss += self.chain_pi_coef * torch.sum(self.chain_argmaxs != new_argmaxs) * (1/self.chain_bs)
-
-        _, self.chain_refs, _, _, _, _, _ = self.memory.sample(self.chain_bs)
-
-        with torch.no_grad():
-            self.chain_qvals = self.net.qvals(self.chain_refs)
-            #self.chain_argmaxs = torch.argmax(self.chain_qvals, dim=1)
-
-        return loss
 
     @torch.no_grad()
     def calculate_parameter_norms(self, norm_type=2):
@@ -968,62 +698,6 @@ class Agent:
 
         average_grad_magnitude = total_grad / total_params
         return average_grad_magnitude
-
-    def calculate_trust_regions(self, loss, loss_v, states, actions, Q_expected, Q_targets):
-        with torch.no_grad():
-            if self.running_std != -999:
-                current_std = torch.std(loss_v).item()
-                self.running_std += current_std
-
-
-                q_k_tgt_net, taus = self.tgt_net(states)
-                target_network_pred = q_k_tgt_net.gather(2,
-                                                         actions.unsqueeze(-1).expand(self.batch_size, self.num_tau, 1))
-
-                # get average across quantiles
-                target_pred_mean = target_network_pred.mean(dim=1)
-                Q_expected_mean = Q_expected.mean(dim=1)
-
-                # q_targets has shape (bs, 1, num_taus), so need to squeeze
-                Q_targets_mean = Q_targets.squeeze().mean(dim=1).unsqueeze(1)
-
-                #  sigma_j calculations
-                sigma_j = self.running_std / self.grad_steps
-
-                sigma_j = max(sigma_j, current_std)
-                sigma_j = max(sigma_j, 0.01)
-
-                # These all need shape checking
-                outside_region = torch.abs(Q_expected_mean - target_pred_mean) > \
-                                 self.tr_alpha * sigma_j
-
-                diff_sign = torch.sign(Q_expected_mean - target_pred_mean) != \
-                            torch.sign(Q_expected_mean - Q_targets_mean)
-
-                # create mask if conditions are true
-                mask = torch.logical_and(outside_region, diff_sign)
-                loss[mask] = 0
-
-                # Some Testing Code
-                """
-                if np.random.random() > 0.995:
-                    print("Mask")
-                    print(mask)
-
-                    # mask out losses
-                    loss[mask] = 0
-                    print(loss)
-
-                    print(Q_expected_mean)
-
-                    x = input(";lol")
-                """
-                return loss
-
-            else:
-                self.running_std = torch.std(loss_v).detach().cpu()
-                return loss
-
 
 def calculate_huber_loss(td_errors, k=1.0, taus=8):
     """
