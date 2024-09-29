@@ -143,23 +143,13 @@ def main():
     parser.add_argument('--tr', type=int, default=0)
 
     parser.add_argument('--double', type=int, default=0)
-    parser.add_argument('--adamw', type=int, default=0)
-    parser.add_argument('--sam', type=int, default=0)
-    parser.add_argument('--discount_anneal', type=int, default=0)
-    parser.add_argument('--ema', type=int, default=0)
     parser.add_argument('--ncos', type=int, default=64)
-    parser.add_argument('--pruning', type=int, default=0)
     parser.add_argument('--per_alpha', type=float, default=0.2)
     parser.add_argument('--per_beta_anneal', type=int, default=0)
     parser.add_argument('--layer_norm', type=int, default=0)
     parser.add_argument('--eps_steps', type=int, default=2000000)
     parser.add_argument('--eps_disable', type=int, default=1)
-    parser.add_argument('--stoch', type=int, default=0)
-    parser.add_argument('--perturb', type=int, default=0)
     parser.add_argument('--activation', type=str, default="relu")
-    parser.add_argument('--selfnorm', type=int, default=0)
-    parser.add_argument('--pessimistic', type=int, default=0)
-    parser.add_argument('--chain', type=int, default=0)
 
     args = parser.parse_args()
 
@@ -171,7 +161,6 @@ def main():
     envs = args.envs
     bs = args.bs
     rr = args.rr
-    ema = args.ema
     tr = args.tr
     c = args.c
     ema_tau = args.ema_tau
@@ -197,35 +186,26 @@ def main():
     impala = args.impala
     discount = args.discount
     linear_size = args.linear_size
-    adamw = args.adamw
     per = args.per
     taus = args.taus
     model_size = args.model_size
     frames = args.frames // 4
     ncos = args.ncos
-    discount_anneal = args.discount_anneal
     maxpool = args.maxpool
     vector = args.vector
-    pruning = args.pruning
     per_alpha = args.per_alpha
     per_beta_anneal = args.per_beta_anneal
     layer_norm = args.layer_norm
     c51 = args.c51
     eps_steps = args.eps_steps
     eps_disable = args.eps_disable
-    stoch = args.stoch
-    sam = args.sam
-    perturb = args.perturb
     activation = args.activation
-    selfnorm = args.selfnorm
-    pessimistic = args.pessimistic
-    chain = args.chain
 
     if not vector:
         lr = 5e-5
-        envs = 4
+        envs = 1
         bs = 16
-        rr = 1
+        rr = 0.25
 
     lr_str = "{:e}".format(lr)
     lr_str = str(lr_str).replace(".", "").replace("0", "")
@@ -286,17 +266,13 @@ def main():
 
     agent = Agent(n_actions=env.action_space[0].n, input_dims=[framestack, 84, 84], device=device, num_envs=num_envs,
                   agent_name=agent_name, total_frames=n_steps, testing=testing, batch_size=bs, rr=rr, lr=lr,
-                  maxpool_size=maxpool_size, ema=ema, trust_regions=tr, target_replace=c, ema_tau=ema_tau,
+                  maxpool_size=maxpool_size, trust_regions=tr, target_replace=c,
                   noisy=noisy, spectral=spectral, munch=munch, iqn=iqn, double=double, dueling=dueling, impala=impala,
-                  discount=discount, adamw=adamw, discount_anneal=discount_anneal, per=per, taus=taus,
+                  discount=discount, per=per, taus=taus,
                   model_size=model_size, linear_size=linear_size, ncos=ncos, maxpool=maxpool, replay_period=num_envs,
-                  analytics=analy, pruning=pruning, framestack=framestack, arch=arch, per_alpha=per_alpha,
+                  analytics=analy, framestack=framestack, arch=arch, per_alpha=per_alpha,
                   per_beta_anneal=per_beta_anneal, layer_norm=layer_norm, c51=c51, eps_steps=eps_steps,
-                  eps_disable=eps_disable, stoch=stoch, perturb=perturb,
-                  activation=activation, selfnorm=selfnorm, pessimistic=pessimistic, n=nstep, munch_alpha=munch_alpha,
-                  sam=sam, grad_clip=grad_clip, chain=chain)
-
-    agent.load_models("BTR_DoubleDunk200M_200M.model")
+                  eps_disable=eps_disable, activation=activation, n=nstep, munch_alpha=munch_alpha, grad_clip=grad_clip)
 
     scores_temp = []
     steps = 0
@@ -317,7 +293,7 @@ def main():
         steps += num_envs
         action = agent.choose_action(observation)
         env.step_async(action)
-        #agent.learn()
+        agent.learn()
         observation_, reward, done_, trun_, info = env.step_wait()
         done_ = np.logical_or(done_, trun_)
 
@@ -333,8 +309,8 @@ def main():
 
         for stream in range(num_envs):
             terminal_in_buffer = done_[stream] or info["lost_life"][stream]
-            # agent.store_transition(observation[stream], action[stream], reward[stream], observation_[stream],
-            #                        terminal_in_buffer, stream=stream)
+            agent.store_transition(observation[stream], action[stream], reward[stream], observation_[stream],
+                                   terminal_in_buffer, stream=stream)
 
         observation = observation_
 
