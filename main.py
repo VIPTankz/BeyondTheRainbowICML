@@ -56,7 +56,7 @@ def evaluate_agent(net_state_dict, network_creator, eval_envs, num_eval_episodes
     eval_net.load_state_dict(state_dict_gpu)
 
     # this massively helps speed up training since agents get stuck in some games, causing evals to last a very
-    # long time
+    # long time. Also nice to see the difference between 0.00 and 0.01 during evals, like Atari Phoenix.
     if index <= 125:
         rng = 0.01
     else:
