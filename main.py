@@ -6,14 +6,14 @@ import gymnasium as gym
 import os
 import argparse
 import multiprocessing as mp
-from Agent import Agent, choose_eval_action, apply_pruning
+from Agent import Agent, choose_eval_action
 from AtariPreprocessingCustom import AtariPreprocessingCustom
 from functools import partial
 from matplotlib import pyplot as plt
 
 def make_env(envs_create, game, life_info, framestack, repeat_probs):
     return gym.vector.AsyncVectorEnv([lambda: gym.wrappers.FrameStack(
-        AtariPreprocessingCustom(gym.make("ALE/" + game + "-v5", frameskip=1, repeat_action_probability=repeat_probs, render_mode="human"), life_information=life_info), framestack,
+        AtariPreprocessingCustom(gym.make("ALE/" + game + "-v5", frameskip=1, repeat_action_probability=repeat_probs), life_information=life_info), framestack,
         lz4_compress=False) for _ in range(envs_create)], context="spawn")
 
     #, render_mode="human"
@@ -40,7 +40,7 @@ def format_arguments(arg_string):
 
 
 def evaluate_agent(net_state_dict, network_creator, eval_envs, num_eval_episodes, agent_name, testing, game, life_info,
-                   n_actions, device, index, framestack, repeat_probs, pruning=False):
+                   n_actions, device, index, framestack, repeat_probs):
 
     eval_env = make_env(eval_envs, game, life_info, framestack, repeat_probs)
     evals = []
@@ -49,9 +49,6 @@ def evaluate_agent(net_state_dict, network_creator, eval_envs, num_eval_episodes
     eval_observation, eval_info = eval_env.reset()
 
     eval_net = network_creator()
-
-    if pruning:
-        apply_pruning(eval_net, 0.0)
 
     # move state dict to gpu - pytorch doesn't allow sharing across threads on gpu
     state_dict_gpu = {k: v.to(device) for k, v in net_state_dict.items()}
@@ -80,9 +77,6 @@ def evaluate_agent(net_state_dict, network_creator, eval_envs, num_eval_episodes
                     break
 
         eval_observation = eval_observation_
-        # for stream in range(eval_envs):
-        #     if eval_done_[stream]:
-        #         eval_observation[stream] = eval_info["final_observation"][stream]
 
     if not testing:
         fname = agent_name + "Evaluation.npy"
@@ -160,7 +154,6 @@ def main():
     bs = args.bs
     rr = args.rr
     c = args.c
-    ema_tau = args.ema_tau
     lr = args.lr
     life_info = args.life_info
     num_eval_episodes = args.num_eval_episodes
@@ -237,11 +230,11 @@ def main():
         np.save(fname, np.zeros((args.frames // 1000000, num_eval_episodes)))
 
     if testing:
-        num_envs = 1
+        num_envs = 4
         eval_envs = 2
-        eval_every = 11580000
-        num_eval_episodes = 5
-        n_steps = 11560000
+        eval_every = 8000
+        num_eval_episodes = 4
+        n_steps = 8000
         bs = 32
     else:
         num_envs = envs
@@ -263,7 +256,7 @@ def main():
 
     agent = Agent(n_actions=env.action_space[0].n, input_dims=[framestack, 84, 84], device=device, num_envs=num_envs,
                   agent_name=agent_name, total_frames=n_steps, testing=testing, batch_size=bs, rr=rr, lr=lr,
-                  maxpool_size=maxpool_size, trust_regions=tr, target_replace=c,
+                  maxpool_size=maxpool_size, target_replace=c,
                   noisy=noisy, spectral=spectral, munch=munch, iqn=iqn, double=double, dueling=dueling, impala=impala,
                   discount=discount, per=per, taus=taus,
                   model_size=model_size, linear_size=linear_size, ncos=ncos, maxpool=maxpool, replay_period=num_envs,
@@ -346,7 +339,7 @@ def main():
                 # Start evaluation in a separate process
                 eval_process = mp.Process(target=evaluate_agent,
                                           args=(net_state_dict, network_creator, eval_envs, num_eval_episodes, agent_name, testing, game,
-                                                life_info, n_actions, device, current_eval, framestack, repeat_probs, pruning))
+                                                life_info, n_actions, device, current_eval, framestack, repeat_probs))
                 eval_process.start()
                 processes.append(eval_process)
 

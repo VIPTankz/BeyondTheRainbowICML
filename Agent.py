@@ -193,8 +193,6 @@ class Agent:
         self.maxpool = maxpool
         self.munchausen = munch
 
-        self.stoch = stoch
-
         if self.munchausen:
             self.entropy_tau = 0.03
             self.lo = -1
@@ -302,13 +300,8 @@ class Agent:
 
             state = T.tensor(observation, dtype=T.float).to(self.net.device)
 
-            if self.stoch:
-                qvals = self.net.qvals(state, advantages_only=False)
-                probs = F.softmax(qvals / self.entropy_tau, dim=1)
-                x = torch.multinomial(probs, num_samples=1).cpu()
-            else:
-                qvals = self.net.qvals(state, advantages_only=True)
-                x = T.argmax(qvals, dim=1).cpu()
+            qvals = self.net.qvals(state, advantages_only=True)
+            x = T.argmax(qvals, dim=1).cpu()
 
             if self.env_steps < self.min_sampling_size or not self.noisy or \
                     (self.env_steps < self.total_frames / 2 and self.eps_disable):

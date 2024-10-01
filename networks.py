@@ -607,7 +607,7 @@ class ImpalaCNNLargeIQN(nn.Module):
         self.in_depth = in_depth
 
         self.activation = activation
-          conv_activation = nn.ReLU
+        conv_activation = nn.ReLU
 
 
         self.linear_size = linear_size
@@ -634,7 +634,7 @@ class ImpalaCNNLargeIQN(nn.Module):
             norm_func = identity
 
 
-          self.conv = nn.Sequential(
+        self.conv = nn.Sequential(
               ImpalaCNNBlock(in_depth, int(16*model_size), norm_func=norm_func, activation=conv_activation,
                              layer_norm=self.layer_norm,
                              layer_norm_shapes=([int(16*model_size), 84, 84], [int(16*model_size), 42, 42])),
@@ -647,7 +647,7 @@ class ImpalaCNNLargeIQN(nn.Module):
               nn.ReLU()
           )
 
-          if self.maxpool:
+        if self.maxpool:
               self.pool = torch.nn.AdaptiveMaxPool2d((self.maxpool_size, self.maxpool_size))
               if self.maxpool_size == 8:
                   self.conv_out_size = 2048 * model_size
@@ -657,7 +657,7 @@ class ImpalaCNNLargeIQN(nn.Module):
                   self.conv_out_size = 512 * model_size
               else:
                   raise Exception("No Conv out size for this maxpool size")
-          else:
+        else:
               self.conv_out_size = int(32 * model_size * 11 * 11)
 
         self.cos_embedding = nn.Linear(self.n_cos, self.conv_out_size)
@@ -666,10 +666,10 @@ class ImpalaCNNLargeIQN(nn.Module):
             if not self.layer_norm:
                 self.dueling = Dueling(
                     nn.Sequential(linear_layer(self.conv_out_size, self.linear_size),
-                                  activation(),
+                                  conv_activation(),
                                   linear_layer(self.linear_size, 1)),
                     nn.Sequential(linear_layer(self.conv_out_size, self.linear_size),
-                                  activation(),
+                                  conv_activation(),
                                   linear_layer(self.linear_size, actions))
                 )
             else:
@@ -678,17 +678,17 @@ class ImpalaCNNLargeIQN(nn.Module):
                 self.dueling = Dueling(
                     nn.Sequential(linear_layer(self.conv_out_size, self.linear_size),
                                   nn.LayerNorm(self.linear_size),
-                                  activation(),
+                                  conv_activation(),
                                   linear_layer(self.linear_size, 1)),
                     nn.Sequential(linear_layer(self.conv_out_size, self.linear_size),
                                   nn.LayerNorm(self.linear_size),
-                                  activation(),
+                                  conv_activation(),
                                   linear_layer(self.linear_size, actions))
                 )
         else:
             self.linear_layers = nn.Sequential(
                     linear_layer(self.conv_out_size, self.linear_size),
-                    activation(),
+                    conv_activation(),
                     linear_layer(self.linear_size, actions))
 
         self.to(device)
