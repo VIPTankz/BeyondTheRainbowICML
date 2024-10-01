@@ -325,8 +325,7 @@ class PER:
         #max_weight = (prob_min * self.capacity) ** (-self.beta)
 
         # Compute importance-sampling weights w
-        weights = (self.capacity * probs) ** -self.alpha  # self.beta originally this was an accident but actually performed better
-        # seems to perform better without this for some reason? This is disabled from the agent class
+        weights = (self.capacity * probs) ** -self.beta
 
         weights = torch.tensor(weights / weights.max(), dtype=torch.float32,
                                device=self.device)  # Normalise by max importance-sampling weight from batch
