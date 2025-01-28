@@ -98,9 +98,6 @@ def evaluate_agent(net_state_dict, network_creator, eval_envs, num_eval_episodes
                     break
 
         eval_observation = eval_observation_
-        # for stream in range(eval_envs):
-        #     if eval_done_[stream]:
-        #         eval_observation[stream] = eval_info["final_observation"][stream]
 
     if not testing:
         fname = agent_name + "Evaluation.npy"
@@ -361,8 +358,6 @@ def main():
         for stream in range(num_envs):
             terminal_in_buffer = done_[stream] or info["lost_life"][stream]
             next_obs = observation_[stream] if not trun_[stream] else np.array(info["final_observation"][stream])
-
-            #np.expand_dims(np.array(info["final_observation"][stream]), 0)
 
             agent.store_transition(observation[stream], action[stream], reward[stream], next_obs,
                                    terminal_in_buffer, trun_[stream], stream=stream)

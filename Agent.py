@@ -15,10 +15,8 @@ from copy import deepcopy
 from functools import partial
 from Analytic import Analytics
 import matplotlib.pyplot as plt
-from utils import cal_dormant_ratio, TruncatedNormal, perturb
 import math
 from collections import defaultdict
-from sam import SAM
 import torchvision.transforms.functional as TF
 
 
@@ -323,14 +321,6 @@ class Agent:
         self.linear_size = linear_size
         self.arch = arch
 
-        # self.memories = []
-        # if self.per:
-        #     for i in range(num_envs):
-        #         self.memories.append(ReplayMemory(self.max_mem_size // num_envs, self.n, self.gamma, device, alpha=self.per_alpha, beta=self.per_beta, procgen=self.procgen))
-        # else:
-        #     for i in range(num_envs):
-        #         self.memories.append(RegularReplayMemory(self.max_mem_size // num_envs, self.n, self.gamma, device))
-
         self.framestack = framestack
         self.rgb = rgb
         self.memory = PER(self.max_mem_size, device, self.n, num_envs, self.gamma, alpha=self.per_alpha,
@@ -385,8 +375,7 @@ class Agent:
         self.cum_act_gap = 0
 
         self.prune = pruning
-        #if self.prune and self.spectral_norm:
-        #raise Exception("Cannot use both pruning and spectral norm")
+
         if self.prune:
             self.desired_sparsity = 0.95
             self.last_sparsity = 0.
@@ -410,13 +399,6 @@ class Agent:
                        (1 - (1 - (current_progress - self.start_prune) / (self.end_prune - self.start_prune)) ** 3)
 
         apply_sparsity = (cur_sparsity - self.last_sparsity) / (1 - self.last_sparsity)
-
-        # print("Applied Sparsity")
-        # print(apply_sparsity)
-        #
-        # print("Target Sparsity")
-        # print(cur_sparsity)
-
         apply_pruning(self.net, apply_sparsity)
 
         self.last_sparsity = cur_sparsity
@@ -446,9 +428,7 @@ class Agent:
             if self.noisy and not self.eval_mode:
                 self.reset_noise(self.net)
 
-            #state = T.tensor(observation, dtype=int).to(self.net.device)
-
-            ###################
+            ################### ColorJitter Code
             # for i in range(len(state)):
             #     # Apply transformations to each frame in the sequence
             #     for j in range(4):  # Assuming 4 is the second dimension representing frames
@@ -549,10 +529,6 @@ class Agent:
 
         if self.env_steps < self.min_sampling_size:
             return
-
-        # if self.per:
-        #     for i in range(self.num_envs):
-        #         self.memories[i].priority_weight = min(self.memories[i].priority_weight + self.priority_weight_increase, 1)
 
         if self.per and self.per_beta_anneal:
             self.memory.beta = min(self.memory.beta + self.priority_weight_increase, 1)

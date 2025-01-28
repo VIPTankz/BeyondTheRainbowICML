@@ -208,7 +208,6 @@ class PER:
         while len(self.state_buffer[stream]) >= self.framestack and len(self.reward_buffer[stream]) > 0:
             # First array in the experience
             first_array = self.state_buffer[stream][:self.framestack]
-            #print(first_array)
 
             # Second array in the experience (Final `framestack` elements)
             second_array = self.state_buffer[stream][-self.framestack:]
@@ -219,11 +218,6 @@ class PER:
             while len(reward_array) < self.n_step:
                 reward_array.extend([0])
 
-            #print(reward_array)
-
-            # print("Added Experience: (" + str(self.point_mem_idx) + ")")
-            # print((np.array(first_array, dtype=int), np.array(second_array, dtype=int),
-            #                                                  np.array(reward_array, dtype=int)))
             # Add the experience
             self.pointer_mem[self.point_mem_idx] = (np.array(first_array, dtype=int), np.array(second_array, dtype=int),
                                                              np.array(reward_array, dtype=int))
@@ -299,8 +293,6 @@ class PER:
 
         # fetch the pointers by using indices
         pointers = self.pointer_mem[idxs]
-        #print("Pointers")
-        #print(pointers)
 
         # Extract the pointers into separate arrays
         state_pointers = np.array([p[0] for p in pointers])
