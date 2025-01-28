@@ -133,6 +133,7 @@ class PER:
         self.action_mem = np.zeros(self.storage_size, dtype=np.int64)
         self.reward_mem = np.zeros(self.storage_size, dtype=float)
         self.done_mem = np.zeros(self.storage_size, dtype=bool)
+        self.trun_mem = np.zeros(self.storage_size, dtype=bool)
 
         # everything here is stored as ints as they are just pointers to the actual memory
         # reward contains N values. The first value contains the action. The set of N contains the pointers for both
@@ -150,20 +151,20 @@ class PER:
         #self.priority_min = [float('inf') for _ in range(2 * self.size)]
         #print("Prio Size: " + str(len(self.priority_min)))
 
-    def append(self, state, action, reward, n_state, done, stream, prio=True):
+    def append(self, state, action, reward, n_state, done, trun, stream, prio=True):
 
         # append to memory
-        self.append_memory(state, action, reward, n_state, done, stream)
+        self.append_memory(state, action, reward, n_state, done, trun, stream)
 
         # append to pointer
         self.append_pointer(stream, prio)
 
-        if done:
+        if done or trun:
             self.finalize_experiences(stream)
             self.state_buffer[stream] = []
             self.reward_buffer[stream] = []
 
-        self.last_terminal[stream] = done
+        self.last_terminal[stream] = done or trun
 
     # def _set_priority_min(self, idx, priority_alpha):
     #     idx += self.size
@@ -238,7 +239,7 @@ class PER:
             if len(self.reward_buffer[stream]) > 0:
                 self.reward_buffer[stream].pop(0)
 
-    def append_memory(self, state, action, reward, n_state, done, stream):
+    def append_memory(self, state, action, reward, n_state, done, trun, stream):
 
         if self.last_terminal[stream]:
             # add full transition
@@ -255,6 +256,7 @@ class PER:
             self.action_mem[self.reward_mem_idx] = action
             self.reward_mem[self.reward_mem_idx] = reward
             self.done_mem[self.reward_mem_idx] = done
+            self.trun_mem[self.reward_mem_idx] = trun
 
             self.reward_buffer[stream].append(self.reward_mem_idx)
             self.reward_mem_idx = (self.reward_mem_idx + 1) % self.storage_size
@@ -270,6 +272,7 @@ class PER:
             self.action_mem[self.reward_mem_idx] = action
             self.reward_mem[self.reward_mem_idx] = reward
             self.done_mem[self.reward_mem_idx] = done
+            self.trun_mem[self.reward_mem_idx] = trun
 
             self.reward_buffer[stream].append(self.reward_mem_idx)
             self.reward_mem_idx = (self.reward_mem_idx + 1) % self.storage_size
@@ -315,17 +318,19 @@ class PER:
         # reward and dones just use the same pointer. actions just use the first one
         rewards = self.reward_mem[reward_pointers]
         dones = self.done_mem[reward_pointers]
+        truns = self.trun_mem[reward_pointers]
         actions = self.action_mem[action_pointers]
 
         # apply n_step cumulation to rewards and dones
         if self.n_step > 1:
-            rewards, dones = self.compute_discounted_rewards_batch(rewards, dones)
+            rewards, dones = self.compute_discounted_rewards_batch(rewards, dones, truns)
 
         #prob_min = self.priority_min[1] / p_total
         #max_weight = (prob_min * self.capacity) ** (-self.beta)
 
         # Compute importance-sampling weights w
-        weights = (self.capacity * probs) ** -self.beta
+        weights = (self.capacity * probs) ** -self.alpha  # self.beta originally this was an accident but actually performed better
+        # seems to perform better without this for some reason? This is disabled from the agent class
 
         weights = torch.tensor(weights / weights.max(), dtype=torch.float32,
                                device=self.device)  # Normalise by max importance-sampling weight from batch
@@ -346,7 +351,7 @@ class PER:
         # return batch
         return tree_idxs, states, actions, rewards, n_states, dones, weights
 
-    def compute_discounted_rewards_batch(self, rewards_batch, dones_batch):
+    def compute_discounted_rewards_batch(self, rewards_batch, dones_batch, truns_batch):
         """
         Compute discounted rewards for a batch of rewards and dones.
 
@@ -368,6 +373,8 @@ class PER:
                 discounted_rewards[i] += cumulative_discount * rewards_batch[i, j]
                 if dones_batch[i, j] == 1:
                     cumulative_dones[i] = True
+                    break
+                elif truns_batch[i, j] == 1:
                     break
                 cumulative_discount *= self.gamma
 

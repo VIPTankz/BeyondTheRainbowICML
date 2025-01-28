@@ -6,8 +6,9 @@ import gymnasium as gym
 import os
 import argparse
 import multiprocessing as mp
-from Agent import Agent, choose_eval_action
+from Agent import Agent, choose_eval_action, apply_pruning
 from AtariPreprocessingCustom import AtariPreprocessingCustom
+import sys
 from functools import partial
 from matplotlib import pyplot as plt
 
@@ -21,14 +22,31 @@ def make_env(envs_create, game, life_info, framestack, repeat_probs):
 
 def non_default_args(args, parser):
     result = []
+    repeat_val = None  # To store the value of 'repeat'
+
+    # Iterate over all arguments
     for arg in vars(args):
+        if arg == 'repeat':
+            # Store the 'repeat' value and skip adding it in the main loop
+            repeat_val = getattr(args, arg)
+            continue
+
         user_val = getattr(args, arg)
         default_val = parser.get_default(arg)
-        if user_val != default_val and default_val != "NameThisGame" and arg != "include_evals" and arg != "eval_envs"\
-                and arg != "num_eval_episodes" and arg != "analy":
 
-            result.append(f"{arg}={user_val}")
-    return ', '.join(result)
+        # Check if the argument should be included
+        if (user_val != default_val and
+                default_val != "NameThisGame" and
+                arg not in ["include_evals", "eval_envs", "num_eval_episodes", "analy", "save_allll"]):
+            # Format: argName + value (e.g., testing1)
+            result.append(f"{arg}{user_val}")
+
+    # After processing all other arguments, handle 'repeat' if it's non-default
+    if repeat_val != parser.get_default('repeat'):
+        result.append(f"repeat{repeat_val}")
+
+    # Join all parts with underscores
+    return '_'.join(result)
 
 
 def format_arguments(arg_string):
@@ -40,7 +58,7 @@ def format_arguments(arg_string):
 
 
 def evaluate_agent(net_state_dict, network_creator, eval_envs, num_eval_episodes, agent_name, testing, game, life_info,
-                   n_actions, device, index, framestack, repeat_probs):
+                   n_actions, device, index, framestack, repeat_probs, pruning=False):
 
     eval_env = make_env(eval_envs, game, life_info, framestack, repeat_probs)
     evals = []
@@ -50,13 +68,16 @@ def evaluate_agent(net_state_dict, network_creator, eval_envs, num_eval_episodes
 
     eval_net = network_creator()
 
+    if pruning:
+        apply_pruning(eval_net, 0.0)
+
     # move state dict to gpu - pytorch doesn't allow sharing across threads on gpu
     state_dict_gpu = {k: v.to(device) for k, v in net_state_dict.items()}
 
     eval_net.load_state_dict(state_dict_gpu)
 
     # this massively helps speed up training since agents get stuck in some games, causing evals to last a very
-    # long time. Also nice to see the difference between 0.00 and 0.01 during evals, like Atari Phoenix.
+    # long time
     if index <= 125:
         rng = 0.01
     else:
@@ -77,6 +98,9 @@ def evaluate_agent(net_state_dict, network_creator, eval_envs, num_eval_episodes
                     break
 
         eval_observation = eval_observation_
+        # for stream in range(eval_envs):
+        #     if eval_done_[stream]:
+        #         eval_observation[stream] = eval_info["final_observation"][stream]
 
     if not testing:
         fname = agent_name + "Evaluation.npy"
@@ -115,6 +139,7 @@ def main():
     parser.add_argument('--maxpool_size', type=int, default=6)
     parser.add_argument('--lr', type=float, default=1e-4)
     parser.add_argument('--testing', type=bool, default=False)
+    parser.add_argument('--ema_tau', type=float, default=2.5e-4)
     parser.add_argument('--munch', type=int, default=1)
     parser.add_argument('--munch_alpha', type=float, default=0.9)
     parser.add_argument('--grad_clip', type=int, default=10)
@@ -133,15 +158,30 @@ def main():
     parser.add_argument('--dueling', type=int, default=1)
     parser.add_argument('--linear_size', type=int, default=512)
     parser.add_argument('--model_size', type=float, default=2)
+    parser.add_argument('--tr', type=int, default=0)
 
     parser.add_argument('--double', type=int, default=0)
+    parser.add_argument('--adamw', type=int, default=0)
+    parser.add_argument('--sam', type=int, default=0)
+    parser.add_argument('--discount_anneal', type=int, default=0)
+    parser.add_argument('--ema', type=int, default=0)
     parser.add_argument('--ncos', type=int, default=64)
+    parser.add_argument('--pruning', type=int, default=0)
     parser.add_argument('--per_alpha', type=float, default=0.2)
     parser.add_argument('--per_beta_anneal', type=int, default=0)
     parser.add_argument('--layer_norm', type=int, default=0)
     parser.add_argument('--eps_steps', type=int, default=2000000)
     parser.add_argument('--eps_disable', type=int, default=1)
+    parser.add_argument('--stoch', type=int, default=0)
+    parser.add_argument('--perturb', type=int, default=0)
     parser.add_argument('--activation', type=str, default="relu")
+    parser.add_argument('--selfnorm', type=int, default=0)
+    parser.add_argument('--pessimistic', type=int, default=0)
+    parser.add_argument('--chain', type=int, default=0)
+
+    parser.add_argument('--rainbow', type=int, default=0)
+
+    parser.add_argument('--save_all', type=int, default=0)
 
     args = parser.parse_args()
 
@@ -153,7 +193,10 @@ def main():
     envs = args.envs
     bs = args.bs
     rr = args.rr
+    ema = args.ema
+    tr = args.tr
     c = args.c
+    ema_tau = args.ema_tau
     lr = args.lr
     life_info = args.life_info
     num_eval_episodes = args.num_eval_episodes
@@ -176,26 +219,38 @@ def main():
     impala = args.impala
     discount = args.discount
     linear_size = args.linear_size
+    adamw = args.adamw
     per = args.per
     taus = args.taus
     model_size = args.model_size
     frames = args.frames // 4
     ncos = args.ncos
+    discount_anneal = args.discount_anneal
     maxpool = args.maxpool
     vector = args.vector
+    pruning = args.pruning
     per_alpha = args.per_alpha
     per_beta_anneal = args.per_beta_anneal
     layer_norm = args.layer_norm
     c51 = args.c51
     eps_steps = args.eps_steps
     eps_disable = args.eps_disable
+    stoch = args.stoch
+    sam = args.sam
+    perturb = args.perturb
     activation = args.activation
+    selfnorm = args.selfnorm
+    pessimistic = args.pessimistic
+    chain = args.chain
+    save_all = args.save_all
+
+    rainbow = args.rainbow
 
     if not vector:
         lr = 5e-5
-        envs = 1
+        envs = 4
         bs = 16
-        rr = 0.25
+        rr = 1
 
     lr_str = "{:e}".format(lr)
     lr_str = str(lr_str).replace(".", "").replace("0", "")
@@ -230,12 +285,16 @@ def main():
         np.save(fname, np.zeros((args.frames // 1000000, num_eval_episodes)))
 
     if testing:
-        num_envs = 4
+        num_envs = 8
         eval_envs = 2
-        eval_every = 8000
-        num_eval_episodes = 4
-        n_steps = 8000
-        bs = 32
+        eval_every = 11580000
+        num_eval_episodes = 5
+        n_steps = 11560000
+        bs = 64
+
+        # churn
+        # bs 256
+        # min sample 80k
     else:
         num_envs = envs
         eval_envs = args.eval_envs
@@ -256,13 +315,16 @@ def main():
 
     agent = Agent(n_actions=env.action_space[0].n, input_dims=[framestack, 84, 84], device=device, num_envs=num_envs,
                   agent_name=agent_name, total_frames=n_steps, testing=testing, batch_size=bs, rr=rr, lr=lr,
-                  maxpool_size=maxpool_size, target_replace=c,
+                  maxpool_size=maxpool_size, ema=ema, trust_regions=tr, target_replace=c, ema_tau=ema_tau,
                   noisy=noisy, spectral=spectral, munch=munch, iqn=iqn, double=double, dueling=dueling, impala=impala,
-                  discount=discount, per=per, taus=taus,
+                  discount=discount, adamw=adamw, discount_anneal=discount_anneal, per=per, taus=taus,
                   model_size=model_size, linear_size=linear_size, ncos=ncos, maxpool=maxpool, replay_period=num_envs,
-                  analytics=analy, framestack=framestack, arch=arch, per_alpha=per_alpha,
+                  analytics=analy, pruning=pruning, framestack=framestack, arch=arch, per_alpha=per_alpha,
                   per_beta_anneal=per_beta_anneal, layer_norm=layer_norm, c51=c51, eps_steps=eps_steps,
-                  eps_disable=eps_disable, activation=activation, n=nstep, munch_alpha=munch_alpha, grad_clip=grad_clip)
+                  eps_disable=eps_disable, stoch=stoch, perturb=perturb,
+                  activation=activation, selfnorm=selfnorm, pessimistic=pessimistic, n=nstep, munch_alpha=munch_alpha,
+                  sam=sam, grad_clip=grad_clip, chain=chain, rainbow=rainbow)
+
 
     scores_temp = []
     steps = 0
@@ -285,11 +347,10 @@ def main():
         env.step_async(action)
         agent.learn()
         observation_, reward, done_, trun_, info = env.step_wait()
-        done_ = np.logical_or(done_, trun_)
 
         for i in range(num_envs):
             scores_count[i] += reward[i]
-            if done_[i]:
+            if done_[i] or trun_[i]:
                 episodes += 1
                 scores.append([scores_count[i], steps])
                 scores_temp.append(scores_count[i])
@@ -299,8 +360,12 @@ def main():
 
         for stream in range(num_envs):
             terminal_in_buffer = done_[stream] or info["lost_life"][stream]
-            agent.store_transition(observation[stream], action[stream], reward[stream], observation_[stream],
-                                   terminal_in_buffer, stream=stream)
+            next_obs = observation_[stream] if not trun_[stream] else np.array(info["final_observation"][stream])
+
+            #np.expand_dims(np.array(info["final_observation"][stream]), 0)
+
+            agent.store_transition(observation[stream], action[stream], reward[stream], next_obs,
+                                   terminal_in_buffer, trun_[stream], stream=stream)
 
         observation = observation_
 
@@ -318,7 +383,9 @@ def main():
             print("Evaluating")
 
             # Save model
-            if not testing and (current_eval + 1) % 10 == 0:
+            if save_all and not testing:
+                agent.save_model()
+            elif not testing and (current_eval + 1) % 10 == 0:  # (currently saving every model)
                 agent.save_model()
 
             fname = agent_name + "Experiment.npy"
@@ -339,13 +406,12 @@ def main():
                 # Start evaluation in a separate process
                 eval_process = mp.Process(target=evaluate_agent,
                                           args=(net_state_dict, network_creator, eval_envs, num_eval_episodes, agent_name, testing, game,
-                                                life_info, n_actions, device, current_eval, framestack, repeat_probs))
+                                                life_info, n_actions, device, current_eval, framestack, repeat_probs, pruning))
                 eval_process.start()
                 processes.append(eval_process)
 
-                current_eval += 1
-
             next_eval += eval_every
+            current_eval += 1
 
     # wait for our evaluations to finish before we quit the program
     for process in processes:

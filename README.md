@@ -1,13 +1,14 @@
-# BeyondTheRainbowICLR
-Repository for the ICLR Paper "BeyondTheRainbow"
+# BeyondTheRainbowICML
+Repository for the ICML Paper "BeyondTheRainbow"
 
 In this paper, show Rainbow DQN extended with the following 6 extensions:
 <img width="782" alt="rainbow_compare" src="https://github.com/VIPTankz/BeyondTheRainbow2024/assets/41129056/8f6eb599-7662-42cf-8003-49ceeb94ffd9">
 
 Here are our results on the Atari-5 and 60 game subsets:
 
-<img width="1464" alt="IndivAblationsGithub" src="https://github.com/user-attachments/assets/5006518b-24e8-48da-94bb-a3f7b595c361">
-<img width="644" alt="Indiv60Github" src="https://github.com/user-attachments/assets/40d9fdcd-f648-4f6e-816e-6e5ebd3053c3">
+![BTR60_curve-1](https://github.com/user-attachments/assets/d75bda0d-1e71-4c69-8906-82924377620a)
+![DualAblationReducedNoise-1](https://github.com/user-attachments/assets/7fec914f-f8db-4dd5-a135-bdece1ef8b3f)
+
 
 For our results, we provide a .csv file named results.csv, containing the results for each game. For each game, there are 200 evaluations, one for each million frames. Per evaluation, there are 100 episode scores.
 
