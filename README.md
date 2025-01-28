@@ -6,8 +6,9 @@ In this paper, show Rainbow DQN extended with the following 6 extensions:
 
 Here are our results on the Atari-5 and 60 game subsets:
 
-[BTR60_curve.pdf](https://github.com/user-attachments/files/18573506/BTR60_curve.pdf)
-[DualAblation.pdf](https://github.com/user-attachments/files/18573508/DualAblation.pdf)
+![BTR60_curve-1](https://github.com/user-attachments/assets/d75bda0d-1e71-4c69-8906-82924377620a)
+![DualAblation-1](https://github.com/user-attachments/assets/cf4e90fc-df06-46d3-823f-c0102b31c4ba)
+
 
 
 For our results, we provide a .csv file named results.csv, containing the results for each game. For each game, there are 200 evaluations, one for each million frames. Per evaluation, there are 100 episode scores.
