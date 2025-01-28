@@ -4,7 +4,7 @@ Repository for the ICML Paper "BeyondTheRainbow"
 In this paper, show Rainbow DQN extended with the following 6 extensions:
 <img width="782" alt="rainbow_compare" src="https://github.com/VIPTankz/BeyondTheRainbow2024/assets/41129056/8f6eb599-7662-42cf-8003-49ceeb94ffd9">
 
-Here are our results on the Atari-5 and 60 game subsets:
+Here are our results on the Atari-60 and our ablations on Atari-5:
 
 ![BTR60_curve-1](https://github.com/user-attachments/assets/d75bda0d-1e71-4c69-8906-82924377620a)
 ![DualAblationReducedNoise-1](https://github.com/user-attachments/assets/7fec914f-f8db-4dd5-a135-bdece1ef8b3f)
