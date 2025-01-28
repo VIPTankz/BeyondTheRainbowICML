@@ -10,7 +10,7 @@ Here are our results on the Atari-60 and our ablations on Atari-5:
 ![DualAblationReducedNoise-1](https://github.com/user-attachments/assets/7fec914f-f8db-4dd5-a135-bdece1ef8b3f)
 
 
-For our results, we provide a .csv file named results.csv, containing the results for each game. For each game, there are 200 evaluations, one for each million frames. Per evaluation, there are 100 episode scores.
+For our results, we provide a .csv file named results.csv, containing the results for each game. For each game, there are 200 evaluations, one for each million frames. Per evaluation, the given value is the average of 100 episodes.
 
 In order to run our results, first install our environment via the requirements.txt file (all code was tested on Python 3.11.0):
 
